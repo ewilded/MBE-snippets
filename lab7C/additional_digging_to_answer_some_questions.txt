@@ -1,0 +1,104 @@
+We want to do some additional debugging to figure out the following:
+
+1) Confirm that the issue with reading program output is in fact target program's output buffering fault (UPDATE: it's not!)
+I still have doubts as I do not recollect such an issue with manual interaction with the program - which we can do by the way, as the program is very easy to exploit manually - we just need to do some recalculations of the leaked integer and use the result in another input.
+
+
+Also, our previous breakpoint was set on the get_unum() function, which was called more frequently than just in the print_menu()... on the other hand, why the fuck wasn't the 'Enter Choice: ' showing up in result of recv? 
+
+This is what I want to determine - whether it's pwnlib's or target program's fault (pwnlib's fault!)
+
+I believe it's pwnlib's. Manual exploitation went with no such problems.
+
+Apparently any libc routine output buffering is by default disabled:
+http://docs.pwntools.com/en/stable/tubes/processes.html
+"stdout (int) – File object or file descriptor number to use for stdout. By default, a pty is used so that any stdout buffering by libc routines is disabled. May also be PIPE to use a normal pipe."
+
+gdb-peda$ break print_menu
+Breakpoint 1 at 0xd07
+
+
+OK, after finding an actual issue in my code (reading too much from a buffer with simple recv() for the leaking purpose, too much including the 'Enter Choice: '), I tried to recvuntil("Enter Choice: ") again. So that was my mistake.
+
+But then, I noticed that (basically the CURRENT version of exploit_shell.py - as opposed to the one uploaded to github, where the recvuntil("Input string to store: ") was forgotten - and thus it worked!) that the exploit simply fails to return anything from recv() after sending '1' to make string ("Input string to store: ") appears to never come to the console.
+
+But I know it does come (confirm with gdb please - b *  0x00000e37 <+242>:   call   0x880 <printf@plt>). Must be a race condition/a bug with the buffering resulting from doing recvuntil() with the same argument twice in a row or more.
+
+Confirmation with gdb:
+
+   0xb77aee2a <main+229>:       mov    DWORD PTR [esp+0x2c],eax
+   0xb77aee2e <main+233>:       lea    eax,[ebx-0x1c59]
+   0xb77aee34 <main+239>:       mov    DWORD PTR [esp],eax
+=> 0xb77aee37 <main+242>:       call   0xb77ae880 <printf@plt>
+   0xb77aee3c <main+247>:       mov    eax,DWORD PTR [ebx+0x54]
+   0xb77aee42 <main+253>:       mov    eax,DWORD PTR [eax]
+   0xb77aee44 <main+255>:       mov    edx,DWORD PTR [esp+0x2c]
+   0xb77aee48 <main+259>:       add    edx,0x8
+Guessed arguments:
+arg[0]: 0xb77af33f ("Input string to store: ")
+[------------------------------------stack-------------------------------------]
+0000| 0xbfb94d10 --> 0xb77af33f ("Input string to store: ")
+0004| 0xbfb94d14 --> 0x9 ('\t')
+0008| 0xbfb94d18 --> 0x2c0003f
+0012| 0xbfb94d1c --> 0xc2
+0016| 0xbfb94d20 --> 0x1
+0020| 0xbfb94d24 --> 0x0
+0024| 0xbfb94d28 --> 0xbfb94e34 --> 0xbfb9585d ("/levels/lab07/lab7C")
+0028| 0xbfb94d2c --> 0x1
+[------------------------------------------------------------------------------]
+Legend: code, data, rodata, value
+
+Breakpoint 1, 0xb77aee37 in main ()
+gdb-peda$ c
+Continuing.
+
+And then the recv() exploit_shell.py window still hangs, waiting for anything to come.
+
+[DEBUG] Received 0xfb bytes:
+    'Deleted most recent number!\n'
+    '\n'
+    '-- UAF Playground Menu ----------------------\n'
+    '1. Make a string\n'
+    '2. Make a number\n'
+    '3. Delete a string\n'
+    '4. Delete a number\n'
+    '5. Print a string\n'
+    '6. Print a number\n'
+    '7. Quit\n'
+    '---------------------------------------------\n'
+    'Enter Choice: '
+[DEBUG] Sent 0x2 bytes:
+    '1\n'
+Traceback (most recent call last):
+  File "exploit_shell.py", line 115, in <module>
+    exploit()
+  File "exploit_shell.py", line 44, in exploit
+    p.recv()
+  File "/usr/local/lib/python2.7/dist-packages/pwnlib/tubes/tube.py", line 73, in recv
+    return self._recv(numb, timeout) or ''
+  File "/usr/local/lib/python2.7/dist-packages/pwnlib/tubes/tube.py", line 152, in _recv
+    if not self.buffer and not self._fillbuffer(timeout):
+  File "/usr/local/lib/python2.7/dist-packages/pwnlib/tubes/tube.py", line 123, in _fillbuffer
+    data = self.recv_raw(4096)
+  File "/usr/local/lib/python2.7/dist-packages/pwnlib/tubes/process.py", line 340, in recv_raw
+    if not self.can_recv_raw(self.timeout):
+  File "/usr/local/lib/python2.7/dist-packages/pwnlib/tubes/process.py", line 384, in can_recv_raw
+    return select.select([self.proc.stdout], [], [], timeout) == ([self.proc.stdout], [], [])
+	
+
+
+Leaving this for later as a challenge to prove and find the bug in pwnlib. 
+
+
+2) Why was the '/tmp/pwn' version of the exploit causing the program to stop, while the shell version did not, making the program quit clean with exit code 0?
+
+
+OK, to this there is an easy answer, luckily. It's because we are not doing p.interactive(), and the p process is a child process of our exploit, hence once we finish, the object gets destroyed and hence the program gets a SIGKILL signal:
+
+[DEBUG] Received 0x5f bytes:
+    'uid=1026(lab7C) gid=1027(lab7C) euid=1027(lab7A) groups=1028(lab7A),1001(gameuser),1027(lab7C)\n'
+[*] Stopped program '/levels/lab07/lab7C'
+
+The same thing does not happen with p.interactive() at the end of exploitation.
+
+
