@@ -714,3 +714,5 @@ OK, we got it:
 [*] Stopped program '/levels/lab07/lab7C'
 
 Still, I wanna know why the program was stopped after this... 
+
+UPDATE: because it was your child process (and you did not run p.interactive()), you moron :D
