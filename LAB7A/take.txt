@@ -1,0 +1,395 @@
+First of all we will have to write a custom shellcode here this time, as the binary is compiled statically (libc will no longer be dynamically linked, instead only the required functions are statically linked, which means they are built in the executable):
+
+/* compiled with: gcc -static -z relro -z now -fstack-protector-all -o lab7A lab7A.c */
+
+Second, this thingy has a nasty timeout (60 seconds) on, in two ways:
+ENABLE_TIMEOUT(60) on line ten (it's a macro from utils.h, setting an sys_exit asm stub routine as SIGALRM handler, while calling alarm(60) afterwards).
+
+But also, this thing is a network application, ran via socat AND timeout:
+lab7end  12237  0.0  0.2   5076  2116 ?        S    18:39   0:00 socat TCP-LISTEN:7741,reuseaddr,fork,su=lab7end EXEC:timeout 60 /levels/lab07/lab7A
+
+So yeah, it actually exits exactly 60 seconds after logging in. To make debugging less of a nuisance, I compiled my own version in /tmp, getting rid of the timeout by commenting it out... Fuck, this might impact the offsets! OK, fuck it, so instead, let's change it to 0. This will lead to alarm(0), which effectively shuts the alarm down.
+This way we will make sure we are not fucking up our offsets:
+
+ENABLE_TIMEOUT(0)
+
+Yup, I can run the local copy after compiling it and it is not killing itself. What a relief :)
+
+Anyway, after running gdb /tmp/lab7A i noticed that the code segment was not ASLR-ed. That got me worried I am again not getting it ASLR-ed when spawning it as a child process from gdb:
+Breakpoint 1, 0x080494fb in print_menu ()
+gdb-peda$ vmmap
+Start      End        Perm      Name
+0x08048000 0x080eb000 r-xp      /tmp/lab7A
+0x080eb000 0x080ed000 rw-p      /tmp/lab7A
+0x080ed000 0x08111000 rw-p      [heap]
+0xb7ffd000 0xb7ffe000 r-xp      [vdso]
+0xb7ffe000 0xb8000000 r--p      [vvar]
+0xbffdf000 0xc0000000 rw-p      [stack]
+
+At the same time I expected the target app to get its code address within 0xb7whatever range, hence the exploit dev environment would not be reliable (I saw this behavior already with a dynamically linked binary, probably lab6B, and could not find answer why it was that way, as randomize_va_space was set to 2, meaning that ALL segments should get randomized). So I decided to attach to a running process instead, from a second console. I had to change the ptrace_scope for this (from root, ofc):
+
+root@warzone:/home/gameadmin# sysctl -w kernel.yama.ptrace_scope=0
+kernel.yama.ptrace_scope = 0
+
+After attaching, still, the code segment was at a fixed base of 0x08048000. So I decided to check the actual target process running with lab7end privs, by attaching to it from root directly. And to my surprise, the mam layout was also like this:
+
+
+=> 0xb772ad4c <__kernel_vsyscall+16>:   pop    ebp
+   0xb772ad4d <__kernel_vsyscall+17>:   pop    edx
+   0xb772ad4e <__kernel_vsyscall+18>:   pop    ecx
+   0xb772ad4f <__kernel_vsyscall+19>:   ret
+   0xb772ad50:  lock stc
+[------------------------------------stack-------------------------------------]
+0000| 0xbfe4fba8 --> 0xbfe4fde8 --> 0xbfe4fe38 --> 0xbfe4fe68 --> 0x8049e70 (<__libc_csu_fini>: push   ebx)
+0004| 0xbfe4fbac --> 0x1000
+0008| 0xbfe4fbb0 --> 0xb7729000 --> 0x0
+0012| 0xbfe4fbb4 --> 0x806e7d2 (<__read_nocancel+24>:   pop    ebx)
+0016| 0xbfe4fbb8 --> 0x80ed3a0 --> 0xfbad2088
+0020| 0xbfe4fbbc --> 0x8052e2e (<_IO_new_file_underflow+254>:   cmp    eax,0x0)
+0024| 0xbfe4fbc0 --> 0x0
+0028| 0xbfe4fbc4 --> 0xb7729000 --> 0x0
+[------------------------------------------------------------------------------]
+Legend: code, data, rodata, value
+0xb772ad4c in __kernel_vsyscall ()
+warning: File "/home/gameadmin/.gdbinit" auto-loading has been declined by your `auto-load safe-path' set to "$debugdir:$datadir/auto-load".
+To enable execution of this file add
+        add-auto-load-safe-path /home/gameadmin/.gdbinit
+line to your configuration file "/root/.gdbinit".
+To completely disable this security protection add
+        set auto-load safe-path /
+line to your configuration file "/root/.gdbinit".
+For more information about this security protection see the
+"Auto-loading safe path" section in the GDB manual.  E.g., run from the shell:
+        info "(gdb)Auto-loading safe path"
+gdb-peda$ vmmap
+Start      End        Perm      Name
+0x08048000 0x080ec000 r-xp      /levels/lab07/lab7A
+0x080ec000 0x080ee000 rw-p      /levels/lab07/lab7A
+0x080ee000 0x080f0000 rw-p      mapped
+0x09a66000 0x09a88000 rw-p      [heap]
+0xb7729000 0xb772a000 rw-p      mapped
+0xb772a000 0xb772b000 r-xp      [vdso]
+0xb772b000 0xb772d000 r--p      [vvar]
+0xbfe30000 0xbfe51000 rw-p      [stack]
+gdb-peda$ quit
+Detaching from program: /levels/lab07/lab7A, process 12239
+
+Well, I guess this is a consequence of the -static linking. So on one hand, we can't access system() to simply jump to it. On the other hand, making a ROP chain is going to be easier as we won't have to add the base to the gadget offsets before stacking them into the chain. Fair enough.
+
+
+OK. We already know where the first vuln is, and now it seems we are not going to need a leak this time, so not looking for another one.
+Actually it's a 3-byte heap overflow stemming from an incorrect bound check using natural number division result for comparison, instead of simply comparing the length to the maximum length... That overflow will most likely allow us to overwrite an integer, which in turn should allow us to perform a much farther overflow against the second message, throughuot the malloc metadata... Overwriting a function pointer on the heap. Still, will have to figure out how to write and deliver the shellcode. 
+
+First, let's see how the data aligns in the memory. This is from gdb ./lab7A compiled locally in /tmp:
+
+Breakpoint 1, 0x0804953f in print_menu ()
+gdb-peda$ vmmap
+Start      End        Perm      Name
+0x08048000 0x080eb000 r-xp      /tmp/lab7A
+0x080eb000 0x080ed000 rw-p      /tmp/lab7A
+0x080ed000 0x08111000 rw-p      [heap]
+0xb7ffd000 0xb7ffe000 r-xp      [vdso]
+0xb7ffe000 0xb8000000 r--p      [vvar]
+0xbffdf000 0xc0000000 rw-p      [stack]
+
+Notice how the code segment is longer here than the one from the target app!
+0x080ec000 versus 0x080eb000! Hopefully this won't make the difference to our exploit, but good to keep in mind. This makes all the other segments to be shifted as well.
+
+Also, second interesting thing to notice, the heap is already mapped as well, even though we have not issued a single malloc() yet.
+
+OK, let's make our first message:
+
+gdb-peda$ c
+Continuing.
++---------------------------------------+
+|        Doom's OTP Service v1.0        |
++---------------------------------------+
+|------------ Services Menu ------------|
+|---------------------------------------|
+| 1. Create secure message              |
+| 2. Edit secure message                |
+| 3. Destroy secure message             |
+| 4. Print message details              |
+| 5. Quit                               |
++---------------------------------------+
+Enter Choice: 1
+-----------------------------------------
+-Using message slot #0
+-Enter data length: 128
+-Enter data to encrypt: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+-Message created successfully!
+
+gdb-peda$
+Continuing.
++---------------------------------------+
+|        Doom's OTP Service v1.0        |
++---------------------------------------+
+|------------ Services Menu ------------|
+|---------------------------------------|
+| 1. Create secure message              |
+| 2. Edit secure message                |
+| 3. Destroy secure message             |
+| 4. Print message details              |
+| 5. Quit                               |
++---------------------------------------+
+Enter Choice: 4
+-----------------------------------------
+-Input message index to print: 0
+
+XOR Pad:
+-----------------------------------------
+c0649574b3945f44be67670c072b6468e75b560258bc112fc59ec76af399c120
+c4657b59d5cd9c6ac5a0d36ccf53bb545dfb53455c48b3091b54d94bcdc94055
+ea50ab1777e29b0f0903a53d1d86e213f637e51eb733af458951194e524cd01e
+fffc9b06df60e71fc380be43a91f416f27facb3cb43ac2437a4ba562e75e6131
+
+Encrypted Message:
+-----------------------------------------
+8125d435f2d51e05ff26264d466a2529a61a174319fd506e84df862bb2d88061
+85243a18948cdd2b84e1922d8e12fa151cba12041d09f2485a15980a8c880114
+ab11ea5636a3da4e4842e47c5cc7a352b776a45ff672ee04c810580f130d915f
+bebdda479e21a65e82c1ff02e85e002e66bb8a7df57b83023b0ae423a61f2070
+
+
+gdb-peda$ vmmap
+Start      End        Perm      Name
+0x08048000 0x080eb000 r-xp      /tmp/lab7A
+0x080eb000 0x080ed000 rw-p      /tmp/lab7A
+0x080ed000 0x08111000 rw-p      [heap]
+0xb7ffc000 0xb7ffd000 rw-p      mapped
+0xb7ffd000 0xb7ffe000 r-xp      [vdso]
+0xb7ffe000 0xb8000000 r--p      [vvar]
+0xbffdf000 0xc0000000 rw-p      [stack]
+gdb-peda$ x/100wx 0x080ed000
+0x80ed000 <static_slotinfo+32>: 		0x00000000      0x00000000      0x00000000      0x00000000
+0x80ed010 <static_slotinfo+48>: 		0x00000000      0x00000000      0x00000000      0x00000000
+0x80ed020 <static_slotinfo+64>: 		0x00000000      0x00000000      0x00000000      0x00000000
+0x80ed030 <static_slotinfo+80>: 		0x00000000      0x00000000      0x00000000      0x00000000
+0x80ed040 <static_slotinfo+96>: 		0x00000000      0x00000000      0x00000000      0x00000000
+0x80ed050 <static_slotinfo+112>:        0x00000000      0x00000000      0x00000000      0x00000000
+0x80ed060 <static_slotinfo+128>:        0x00000000      0x00000000      0x00000000      0x00000000
+0x80ed070 <static_slotinfo+144>:        0x00000000      0x00000000      0x00000000      0x00000000
+0x80ed080 <static_slotinfo+160>:        0x00000000      0x00000000      0x00000000      0x00000000
+0x80ed090 <static_slotinfo+176>:        0x00000000      0x00000000      0x00000000      0x00000000
+0x80ed0a0 <static_slotinfo+192>:        0x00000000      0x00000000      0x00000000      0x00000000
+0x80ed0b0 <static_slotinfo+208>:        0x00000000      0x00000000      0x00000000      0x00000000
+0x80ed0c0 <static_slotinfo+224>:        0x00000000      0x00000000      0x00000000      0x00000000
+0x80ed0d0 <static_slotinfo+240>:        0x00000000      0x00000000      0x00000000      0x00000000
+0x80ed0e0 <static_slotinfo+256>:        0x00000000      0x00000000      0x00000000      0x00000000
+0x80ed0f0 <static_slotinfo+272>:        0x00000000      0x00000000      0x00000000      0x00000000
+0x80ed100 <static_slotinfo+288>:        0x00000000      0x00000000      0x00000000      0x00000000
+0x80ed110 <static_slotinfo+304>:        0x00000000      0x00000000      0x00000000      0x00000000
+0x80ed120 <static_slotinfo+320>:        0x00000000      0x00000000      0x00000000      0x00000000
+
+Hm?? Where's the data? :D
+
+Let's search for the fucking XOR stub to pin it down...
+
+"XOR Pad:
+-----------------------------------------
+c0649574..."
+
+gdb-peda$ searchmem 0x749564c0 0x080ed000 0x08111000
+Searching for '0x749564c0' in range: 0x80ed000 - 0x8111000
+Found 1 results, display max 1 items:
+[heap] : 0x80f09d4 --> 0x749564c0
+
+So yeah, it's heap. But for some reason it's not at the top of it, but at its bottom instead.
+
+gdb-peda$ p 0x80f09d4-0x80ed000
+$1 = 0x39d4
+
+Yeah quite far.
+
+gdb-peda$ x/100wx 0x80f09d4
+0x80f09d4:      0x749564c0      0x445f94b3      0x0c6767be      0x68642b07
+0x80f09e4:      0x02565be7      0x2f11bc58      0x6ac79ec5      0x20c199f3
+0x80f09f4:      0x597b65c4      0x6a9ccdd5      0x6cd3a0c5      0x54bb53cf
+0x80f0a04:      0x4553fb5d      0x09b3485c      0x4bd9541b      0x5540c9cd
+0x80f0a14:      0x17ab50ea      0x0f9be277      0x3da50309      0x13e2861d
+0x80f0a24:      0x1ee537f6      0x45af33b7      0x4e195189      0x1ed04c52
+0x80f0a34:      0x069bfcff      0x1fe760df      0x43be80c3      0x6f411fa9
+0x80f0a44:      0x3ccbfa27      0x43c23ab4      0x62a54b7a      0x31615ee7
+0x80f0a54:      0x35d42581      0x051ed5f2      0x4d2626ff      0x29256a46
+0x80f0a64:      0x43171aa6      0x6e50fd19      0x2b86df84      0x6180d8b2
+0x80f0a74:      0x183a2485      0x2bdd8c94      0x2d92e184      0x15fa128e
+0x80f0a84:      0x0412ba1c      0x48f2091d      0x0a98155a      0x1401888c
+0x80f0a94:      0x56ea11ab      0x4edaa336      0x7ce44248      0x52a3c75c
+0x80f0aa4:      0x5fa476b7      0x04ee72f6      0x0f5810c8      0x5f910d13
+0x80f0ab4:      0x47dabdbe      0x5ea6219e      0x02ffc182      0x2e005ee8
+0x80f0ac4:      0x7d8abb66      0x02837bf5      0x23e40a3b      0x70201fa6
+0x80f0ad4:      0x00000080      0x00000000      0x00020529      0x00000000
+0x80f0ae4:      0x00000000      0x00000000      0x00000000      0x00000000
+0x80f0af4:      0x00000000      0x00000000      0x00000000      0x00000000
+
+Mkay...
+
+gdb-peda$ x/100wx 0x80f09d4-0x20
+0x80f09b4:      0x00000000      0x00000000      0x00000000      0x00000000
+0x80f09c4:      0x00000000      0x00000000      0x00000111      0x08048fd3 <-- this looks like the print pointer
+0x80f09d4:      0x749564c0      0x445f94b3      0x0c6767be      0x68642b07
+0x80f09e4:      0x02565be7      0x2f11bc58      0x6ac79ec5      0x20c199f3
+0x80f09f4:      0x597b65c4      0x6a9ccdd5      0x6cd3a0c5      0x54bb53cf
+0x80f0a04:      0x4553fb5d      0x09b3485c      0x4bd9541b      0x5540c9cd
+0x80f0a14:      0x17ab50ea      0x0f9be277      0x3da50309      0x13e2861d
+0x80f0a24:      0x1ee537f6      0x45af33b7      0x4e195189      0x1ed04c52
+0x80f0a34:      0x069bfcff      0x1fe760df      0x43be80c3      0x6f411fa9
+0x80f0a44:      0x3ccbfa27      0x43c23ab4      0x62a54b7a      0x31615ee7
+0x80f0a54:      0x35d42581      0x051ed5f2      0x4d2626ff      0x29256a46
+0x80f0a64:      0x43171aa6      0x6e50fd19      0x2b86df84      0x6180d8b2
+0x80f0a74:      0x183a2485      0x2bdd8c94      0x2d92e184      0x15fa128e
+0x80f0a84:      0x0412ba1c      0x48f2091d      0x0a98155a      0x1401888c
+0x80f0a94:      0x56ea11ab      0x4edaa336      0x7ce44248      0x52a3c75c
+0x80f0aa4:      0x5fa476b7      0x04ee72f6      0x0f5810c8      0x5f910d13
+0x80f0ab4:      0x47dabdbe      0x5ea6219e      0x02ffc182      0x2e005ee8
+0x80f0ac4:      0x7d8abb66      0x02837bf5      0x23e40a3b      0x70201fa6
+0x80f0ad4:      0x00000080      0x00000000      0x00020529      0x00000000
+0x80f0ae4:      0x00000000      0x00000000      0x00000000      0x00000000
+0x80f0af4:      0x00000000      0x00000000      0x00000000      0x00000000
+
+Yup, it's the print pointer.
+gdb-peda$ x/10i 0x08048fd3
+   0x8048fd3 <print_message>:   push   ebp
+   0x8048fd4 <print_message+1>: mov    ebp,esp
+   0x8048fd6 <print_message+3>: sub    esp,0x28
+   0x8048fd9 <print_message+6>: mov    eax,DWORD PTR [ebp+0x8]
+   0x8048fdc <print_message+9>: mov    DWORD PTR [ebp-0x1c],eax
+   0x8048fdf <print_message+12>:        mov    eax,gs:0x14
+   0x8048fe5 <print_message+18>:        mov    DWORD PTR [ebp-0xc],eax
+   0x8048fe8 <print_message+21>:        xor    eax,eax
+   0x8048fea <print_message+23>:        mov    DWORD PTR [ebp-0x18],0x0
+   0x8048ff1 <print_message+30>:        mov    eax,DWORD PTR [ebp-0x1c]
+   
+And this 0x80f09c4:      0x00000000      0x00000000      0x00000111 looks like the message length.
+
+gameadmin@warzone:~$ printf "%d" 0x111
+273gameadmin@warzone:~$
+
+Mhm... This looks more like malloc meta (chunk's length).
+
+What about this:
+
+0x80f0ad4:      0x00000080 
+
+$ printf "%d" 0x80
+128gameadmin@warzone:~$
+
+Yeah, more like it. And 0x80f0ad4:      0x00000080      0x00000000      0x00020529 <-- this is again malloc meta.
+
+Right.
+So let's create a second message and see how they are aligned.
+
+gdb-peda$ c
+Continuing.
++---------------------------------------+
+|        Doom's OTP Service v1.0        |
++---------------------------------------+
+|------------ Services Menu ------------|
+|---------------------------------------|
+| 1. Create secure message              |
+| 2. Edit secure message                |
+| 3. Destroy secure message             |
+| 4. Print message details              |
+| 5. Quit                               |
++---------------------------------------+
+Enter Choice: 1
+-----------------------------------------
+-Using message slot #1
+-Enter data length: 128
+-Enter data to encrypt: BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB
+-Message created successfully!
+
+gdb-peda$
+Continuing.
++---------------------------------------+
+|        Doom's OTP Service v1.0        |
++---------------------------------------+
+|------------ Services Menu ------------|
+|---------------------------------------|
+| 1. Create secure message              |
+| 2. Edit secure message                |
+| 3. Destroy secure message             |
+| 4. Print message details              |
+| 5. Quit                               |
++---------------------------------------+
+Enter Choice: 4
+-----------------------------------------
+-Input message index to print: 1
+
+XOR Pad:
+-----------------------------------------
+67cf210838b30c6fef89c5194e2b780a906f1e1eb4288d0442c5392b54d59977
+89f6296f07660d182329554ce7f17d3464aec0213f7d2e18b4bbbe094eff6b39
+b65fca27bdbe63476c854e4dac97af4674f2120df5d6671bfee37f6573efae13
+d4374f3bc2643e291d0ff002fc311b78769f006d975a9565e3907c29dd6e2275
+
+Encrypted Message:
+-----------------------------------------
+258d634a7af14e2dadcb875b0c693a48d22d5c5cf66acf4600877b691697db35
+cbb46b2d45244f5a616b170ea5b33f7626ec82637d3f6c5af6f9fc4b0cbd297b
+f41d8865fffc21052ec70c0feed5ed0436b0504fb7942559bca13d2731adec51
+96750d7980267c6b5f4db240be73593a34dd422fd518d727a1d23e6b9f2c6037
+
+
+gdb-peda$ x/100wx 0x80f09d4-0x40
+0x80f0994:      0x00000000      0x00000000      0x00000000      0x00000000
+0x80f09a4:      0x00000000      0x00000000      0x00000000      0x00000000
+0x80f09b4:      0x00000000      0x00000000      0x00000000      0x00000000
+0x80f09c4:      0x00000000      0x00000000      0x00000111      0x08048fd3
+0x80f09d4:      0x749564c0      0x445f94b3      0x0c6767be      0x68642b07
+0x80f09e4:      0x02565be7      0x2f11bc58      0x6ac79ec5      0x20c199f3
+0x80f09f4:      0x597b65c4      0x6a9ccdd5      0x6cd3a0c5      0x54bb53cf
+
+
+Nothing above the first one. It's below:
+
+gdb-peda$ x/200wx 0x80f09d4-0x40
+0x80f0994:      0x00000000      0x00000000      0x00000000      0x00000000
+0x80f09a4:      0x00000000      0x00000000      0x00000000      0x00000000
+0x80f09b4:      0x00000000      0x00000000      0x00000000      0x00000000
+0x80f09c4:      0x00000000      0x00000000      0x00000111      0x08048fd3
+0x80f09d4:      0x749564c0      0x445f94b3      0x0c6767be      0x68642b07
+0x80f09e4:      0x02565be7      0x2f11bc58      0x6ac79ec5      0x20c199f3
+0x80f09f4:      0x597b65c4      0x6a9ccdd5      0x6cd3a0c5      0x54bb53cf
+0x80f0a04:      0x4553fb5d      0x09b3485c      0x4bd9541b      0x5540c9cd
+0x80f0a14:      0x17ab50ea      0x0f9be277      0x3da50309      0x13e2861d
+0x80f0a24:      0x1ee537f6      0x45af33b7      0x4e195189      0x1ed04c52
+0x80f0a34:      0x069bfcff      0x1fe760df      0x43be80c3      0x6f411fa9
+0x80f0a44:      0x3ccbfa27      0x43c23ab4      0x62a54b7a      0x31615ee7
+0x80f0a54:      0x35d42581      0x051ed5f2      0x4d2626ff      0x29256a46
+0x80f0a64:      0x43171aa6      0x6e50fd19      0x2b86df84      0x6180d8b2
+0x80f0a74:      0x183a2485      0x2bdd8c94      0x2d92e184      0x15fa128e
+0x80f0a84:      0x0412ba1c      0x48f2091d      0x0a98155a      0x1401888c
+0x80f0a94:      0x56ea11ab      0x4edaa336      0x7ce44248      0x52a3c75c
+0x80f0aa4:      0x5fa476b7      0x04ee72f6      0x0f5810c8      0x5f910d13
+0x80f0ab4:      0x47dabdbe      0x5ea6219e      0x02ffc182      0x2e005ee8
+0x80f0ac4:      0x7d8abb66      0x02837bf5      0x23e40a3b      0x70201fa6
+0x80f0ad4:      0x00000080      0x00000000      0x00000111      0x08048fd3 <-- again, the same malloc meta length, same print pointer
+0x80f0ae4:      0x0821cf67      0x6f0cb338      0x19c589ef      0x0a782b4e
+0x80f0af4:      0x1e1e6f90      0x048d28b4      0x2b39c542      0x7799d554
+0x80f0b04:      0x6f29f689      0x180d6607      0x4c552923      0x347df1e7
+0x80f0b14:      0x21c0ae64      0x182e7d3f      0x09bebbb4      0x396bff4e
+0x80f0b24:      0x27ca5fb6      0x4763bebd      0x4d4e856c      0x46af97ac
+0x80f0b34:      0x0d12f274      0x1b67d6f5      0x657fe3fe      0x13aeef73
+0x80f0b44:      0x3b4f37d4      0x293e64c2      0x02f00f1d      0x781b31fc
+0x80f0b54:      0x6d009f76      0x65955a97      0x297c90e3      0x75226edd
+0x80f0b64:      0x4a638d25      0x2d4ef17a      0x5b87cbad      0x483a690c
+0x80f0b74:      0x5c5c2dd2      0x46cf6af6      0x697b8700      0x35db9716
+0x80f0b84:      0x2d6bb4cb      0x5a4f2445      0x0e176b61      0x763fb3a5
+0x80f0b94:      0x6382ec26      0x5a6c3f7d      0x4bfcf9f6      0x7b29bd0c
+0x80f0ba4:      0x65881df4      0x0521fcff      0x0f0cc72e      0x04edd5ee
+0x80f0bb4:      0x4f50b036      0x592594b7      0x273da1bc      0x51ecad31
+0x80f0bc4:      0x790d7596      0x6b7c2680      0x40b24d5f      0x3a5973be
+0x80f0bd4:      0x2f42dd34      0x27d718d5      0x6b3ed2a1      0x37602c9f
+0x80f0be4:      0x00000080      0x00000000      0x00020419      0x00000000 <-- same msg_len (0x80) and then malloc meta
+0x80f0bf4:      0x00000000      0x00000000      0x00000000      0x00000000
+
+So, we create first message with length 131. Then we edit it, to overwrite the length field to a greater value (we want at least 144 to overwrite the next pointer).
+
+Then we create the second message.
+
+Then we edit the first message (msg_len is now 144) and this way we overwrite the print pointer of the second message.
+
+Then we ask the program to print the second message, taking control over the execution.
+
+Then we will worry about the ROP chain/shellcode.
