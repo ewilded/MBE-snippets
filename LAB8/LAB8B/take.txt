@@ -904,3 +904,15 @@ Manipulating the sum requires manipulating v1 and v2. Hence, we need to do thing
 8. Load fave[6] to v2 (this will overwrite its pointer with system())
 9. 'Print' v2 and get shell - without using the thisIsSecret() function - bonus version :)
 
+Right, it did not want to work (fgets() was failing) - so I looked up man fgets() only to realize that fgets() expects 3 arguments while the function I was looking for was gets() - taking only one argument, the buffer to overflow :DD Yeah.
+
+
+gdb-peda$ p gets
+$1 = {<text variable, no debug info>} 0xb7e87cd0 <_IO_gets>
+gdb-peda$ p printf
+$2 = {<text variable, no debug info>} 0xb7e70280 <__printf>
+
+gdb-peda$ p 0xb7e87cd0-0xb7e70280
+$3 = 0x17a50
+
+So we have to add 0x17a50 to printf to attain gets.
